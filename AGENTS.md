@@ -43,6 +43,11 @@ Durable rules for coding agents in this checkout. This is not a runtime inventor
 - Do not require a full desktop environment.
 - Do not route this project through Codex authentication or the Codex backend merely because that integration is easier.
 - Normal Chat and Codex are separate product and authentication paths for this project.
+- For the eBay AI Activate Enterprise workspace, ChatGPT Developer Mode is unavailable. Custom MCP connectors, including `Codex Native2`, cannot be created there. Treat this as settled, not as an open question.
+- Do not plan or implement a solution that requires Developer Mode, a custom ChatGPT connector, or `Codex Native2` for this workspace unless a later live verification proves that capability is available.
+- The verified local Full infrastructure at `~/.chatgpt-omp/full` remains valid. Do not delete or dismantle it merely because its original connector path is blocked.
+- The next tool-loop direction is connector-free integration.
+- Do not provision OpenAI Tunnel credentials for the blocked connector path unless a later design actually requires them.
 
 ## Validation
 
