@@ -447,6 +447,12 @@ function prepareSetup(options: SetupOptions): PreparedSetup {
   });
   delete config.purpose;
   const launcherOwned = config.browserHost === "launcher";
+  if (config.browserHost === "attached-chrome") {
+    throw new Error(
+      "attached-chrome keeps authentication in the external Chrome session. "
+      + "Setup does not launch Chrome or import storage state.",
+    );
+  }
   if (!launcherOwned && process.platform !== "darwin") {
     throw new Error(
       "Terminal-only managed Chrome setup currently requires macOS. "

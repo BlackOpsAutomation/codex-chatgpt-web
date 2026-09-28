@@ -5,6 +5,7 @@ import { skillFileTokens, validateSkillFiles } from "./skill-attachments";
 import { detectChatGptLimitsPlan, readChatGptUsageAccount, readChatGptUsageModel, supportsChatGptUsageTracking, type ChatGptUsageModel } from "./limits";
 import { chromium, type Browser, type BrowserContext, type Locator, type Page, type Request, type Response } from "playwright-core";
 import {
+  assertLoopbackBrowserAttachEndpoint,
   atomicWriteFile,
   CHATGPT_CONNECTOR_NAME,
   defaultChromeExecutable,
@@ -66,6 +67,7 @@ import {
   readChatGptEffortSnapshot,
 } from "../../chatgpt-session";
 import { loginVerificationMarkerPath } from "../../browser-login";
+import { connectAttachedChrome, pageForAttachedChrome } from "../../attached-chrome-host";
 import {
   connectLauncherBrowserHost,
   LauncherBrowserTurnCancelledError,
@@ -1334,8 +1336,9 @@ interface ChatGptSubmissionDomCache {
 
 export interface ResolvedBrowserConfig {
   appName: string;
-  browserHost: "managed-chrome" | "launcher";
+  browserHost: "managed-chrome" | "launcher" | "attached-chrome";
   browserHostDescriptorPath?: string;
+  browserAttachEndpoint?: string;
   browserHelperScriptPath?: string;
   browserDiagnosticsPath?: string;
   storageStatePath: string;
@@ -2076,7 +2079,11 @@ export function resolveBrowserConfig(provider: CodexProviderConfig): ResolvedBro
   const configured = provider.chatgptWeb ?? {};
   const appName = configured.appName?.trim() || CHATGPT_CONNECTOR_NAME;
   const browserHost = configured.browserHost ?? "managed-chrome";
+  if (browserHost !== "managed-chrome" && browserHost !== "launcher" && browserHost !== "attached-chrome") {
+    throw new Error(`Invalid ChatGPT web browser host: ${browserHost}`);
+  }
   const browserHostDescriptorPath = configured.browserHostDescriptorPath?.trim();
+  const browserAttachEndpoint = configured.browserAttachEndpoint?.trim();
   const browserHelperScriptPath = configured.browserHelperScriptPath?.trim();
   const browserDiagnosticsPath = resolve(expandUserPath(
     configured.browserDiagnosticsPath?.trim() || join(getConfigDir(), "diagnostics", "browser-turns"),
@@ -2085,6 +2092,15 @@ export function resolveBrowserConfig(provider: CodexProviderConfig): ResolvedBro
   if (browserHost === "launcher" && !browserHostDescriptorPath) {
     throw new Error("Launcher browser host requires chatgptWeb.browserHostDescriptorPath");
   }
+  if (browserHost === "attached-chrome" && !browserAttachEndpoint) {
+    throw new Error("attached-chrome requires chatgptWeb.browserAttachEndpoint");
+  }
+  if (browserAttachEndpoint && browserHost !== "attached-chrome") {
+    throw new Error("browserAttachEndpoint is only valid for attached-chrome");
+  }
+  const resolvedAttachEndpoint = browserAttachEndpoint
+    ? assertLoopbackBrowserAttachEndpoint(browserAttachEndpoint)
+    : undefined;
   if (browserHelperScriptPath && browserHost !== "launcher") {
     throw new Error("Explicit browser helper script requires a launcher host");
   }
@@ -2101,13 +2117,17 @@ export function resolveBrowserConfig(provider: CodexProviderConfig): ResolvedBro
   if (isLegacyChatGptConnectorName(appName)) {
     throw new Error(legacyChatGptConnectorMigrationMessage(appName));
   }
+  const storageStatePath = browserHost === "attached-chrome"
+    ? (configured.storageStatePath?.trim() ? resolve(expandUserPath(configured.storageStatePath.trim())) : "")
+    : resolve(expandUserPath(configured.storageStatePath?.trim() || join(getConfigDir(), "browser", "storage-state.json")));
   return {
     appName,
     browserHost,
     ...(browserHostDescriptorPath ? { browserHostDescriptorPath: resolve(expandUserPath(browserHostDescriptorPath)) } : {}),
+    ...(resolvedAttachEndpoint ? { browserAttachEndpoint: resolvedAttachEndpoint } : {}),
     ...(resolvedBrowserHelperScriptPath ? { browserHelperScriptPath: resolvedBrowserHelperScriptPath } : {}),
     browserDiagnosticsPath,
-    storageStatePath: resolve(expandUserPath(configured.storageStatePath?.trim() || join(getConfigDir(), "browser", "storage-state.json"))),
+    storageStatePath,
     chromeExecutablePath: resolve(expandUserPath(configured.chromeExecutablePath?.trim() || defaultChromeExecutable())),
     ...(turnTimeoutMs !== undefined ? { turnTimeoutMs } : {}),
     headed: configured.headed !== false,
@@ -2221,6 +2241,7 @@ export class ChatGptBrowserWorker {
   private context?: BrowserContext;
   private page?: Page;
   private managedBrowserReady?: Promise<{ browser: Browser; context: BrowserContext }>;
+  private attachedReady?: Promise<{ browser: Browser; context: BrowserContext }>;
   private launcherHelper?: LauncherBrowserHelperClient;
   private maintenanceTail: Promise<void> = Promise.resolve();
   private readonly activeRuns = new Map<string, Promise<string>>();
@@ -2354,9 +2375,11 @@ export class ChatGptBrowserWorker {
     this.context = undefined;
     this.page = undefined;
     this.managedBrowserReady = undefined;
-    // For connectOverCDP, Playwright implements Browser.close as a transport disconnect; it does
-    // not close the launcher-owned Electron process. Always release that connection and its
-    // artifact directory instead of leaking one per timeout/helper lifecycle.
+    this.attachedReady = undefined;
+    // connectOverCDP close is a transport disconnect. Playwright gives that connection a
+    // browserProcess whose close and kill handlers only close the CDP transport and remove
+    // Playwright artifacts. This releases launcher and attached-chrome connections without
+    // signaling the external Chrome process.
     if (browser) await browser.close();
   }
 
@@ -2424,6 +2447,13 @@ export class ChatGptBrowserWorker {
       this.page = connection.page;
       return this.page;
     }
+    if (this.config.browserHost === "attached-chrome") {
+      const { browser } = await this.ensureAttachedContext();
+      const selected = await pageForAttachedChrome(browser);
+      this.context = selected.context;
+      this.page = selected.page;
+      return selected.page;
+    }
     if (!existsSync(this.config.storageStatePath) || !existsSync(loginVerificationMarkerPath(this.config.storageStatePath))) {
       throw new Error(`ChatGPT web login state is missing: ${this.config.storageStatePath}`);
     }
@@ -2439,7 +2469,28 @@ export class ChatGptBrowserWorker {
     return this.page;
   }
 
+  private async ensureAttachedContext(): Promise<{ browser: Browser; context: BrowserContext }> {
+    if (this.attachedReady) return this.attachedReady;
+    const endpoint = this.config.browserAttachEndpoint;
+    if (!endpoint) throw new Error("attached-chrome requires chatgptWeb.browserAttachEndpoint");
+    const opening = connectAttachedChrome(endpoint).then(connection => {
+      this.browser = connection.browser;
+      this.context = connection.context;
+      return connection;
+    });
+    this.attachedReady = opening;
+    try {
+      return await opening;
+    } catch (error) {
+      if (this.attachedReady === opening) this.attachedReady = undefined;
+      throw error;
+    }
+  }
+
   private async ensureManagedBrowser(): Promise<{ browser: Browser; context: BrowserContext }> {
+    if (this.config.browserHost !== "managed-chrome") {
+      throw new Error("Managed Chrome acquisition requested for a different browser host");
+    }
     if (this.managedBrowserReady) return this.managedBrowserReady;
     const opening = (async () => {
       if (!existsSync(this.config.storageStatePath) || !existsSync(loginVerificationMarkerPath(this.config.storageStatePath))) {
@@ -2470,10 +2521,16 @@ export class ChatGptBrowserWorker {
    * A Codex turn owns one isolated browser conversation. Reusing the same
    * ChatGPT SPA page can retain the previous transcript and autocomplete DOM,
    * so an @app lookup may select stale UI from the preceding turn.
+   * attached-chrome creates that page in the external browser's existing context
+   * and does not close pages it did not create.
    */
   private async pageForNewTurn(): Promise<Page> {
     if (this.config.browserHost === "launcher") {
       throw new Error("Launcher turns require an explicitly leased browser surface");
+    }
+    if (this.config.browserHost === "attached-chrome") {
+      const { context } = await this.ensureAttachedContext();
+      return context.newPage();
     }
     const { context } = await this.ensureManagedBrowser();
     return await context.newPage();

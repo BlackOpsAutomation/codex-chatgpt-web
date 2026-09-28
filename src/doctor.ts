@@ -131,6 +131,12 @@ export async function runDoctor(): Promise<DoctorReport> {
         detail: error instanceof Error ? error.message : String(error),
       });
     }
+  } else if (config.browserHost === "attached-chrome") {
+    checks.push({
+      id: "browser-host",
+      status: "ok",
+      message: "attached-chrome uses an external loopback CDP endpoint; storage-state files are not required and this check does not prove authentication",
+    });
   } else {
     if (!existsSync(config.chromeExecutablePath)) {
       checks.push({ id: "chrome", status: "error", message: `Chrome executable is missing: ${config.chromeExecutablePath}` });
@@ -147,7 +153,6 @@ export async function runDoctor(): Promise<DoctorReport> {
       checks.push({ id: "login", status: "ok", message: "ChatGPT login state has authenticated browser evidence" });
     }
   }
-
   const codex = inspectCodexIntegration();
   if (!codex.installed) {
     checks.push({ id: "codex", status: "error", message: "Codex model route is not installed" });

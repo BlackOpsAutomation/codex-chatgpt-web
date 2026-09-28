@@ -121,6 +121,19 @@ server-authenticated session and the Temporary Chat composer in the primary owne
 the temporary auth view. There is no browser-profile handoff, cookie import, CDP login port, or
 temporary session-transfer directory.
 
+`attached-chrome` is a third browser host. It does not launch Chrome, own the profile, or use the
+launcher descriptor, control endpoint, surface lease, or helper process. Configuration supplies an
+explicit `browserAttachEndpoint` of the form `http://127.0.0.1:<port>`, `http://localhost:<port>`,
+or `http://[::1]:<port>`. The worker calls `chromium.connectOverCDP`, uses the existing browser
+context, and does not call `browser.newContext({ storageState })`. Session inspection prefers an
+existing `https://chatgpt.com` page by URL and otherwise opens a new page in that same context.
+Each automatic turn opens its own page in that context so a previous transcript is not reused, and
+closes only that page. `browser.close()` disconnects the CDP transport and does not terminate the
+external Chrome process. `storage-state.json` and its verification marker are not required.
+Authentication bootstrap stays outside this mode: a CDP connection alone is not authenticated-session
+evidence. Observable page checks, including the visible composer, remain the session proof.
+
+
 The current compiled Codex task context is inserted as one inline JSON envelope. Image bytes stay
 out of the JSON and are attached natively with stable references. The runtime does not create a
 context JSONL file, upload a synthetic context document, include prompt hashes, or silently truncate

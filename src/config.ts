@@ -11,7 +11,7 @@ import type { CodexProviderConfig } from "./types";
 import { VERSION } from "./version";
 
 export type RuntimeMode = "browser-only" | "full";
-export type BrowserHostMode = "managed-chrome" | "launcher";
+export type BrowserHostMode = "managed-chrome" | "launcher" | "attached-chrome";
 export type BrowserInteractionMode = "automatic" | "manual";
 export type SubagentProtocol = "compatibility-v1" | "native";
 
@@ -110,6 +110,8 @@ export interface AppConfig {
   browserHost: BrowserHostMode;
   browserInteractionMode: BrowserInteractionMode;
   browserHostDescriptorPath?: string;
+  /** Loopback CDP endpoint of an already-running ordinary Chrome. attached-chrome only. */
+  browserAttachEndpoint?: string;
   chromeExecutablePath: string;
   storageStatePath: string;
   brokerSocketPath: string;
@@ -150,6 +152,27 @@ export function expandUserPath(value: string): string {
   if (value === "~") return homedir();
   if (value.startsWith("~/") || value.startsWith("~\\")) return join(homedir(), value.slice(2));
   return value;
+}
+
+export function assertLoopbackBrowserAttachEndpoint(value: string): string {
+  if (!value.trim()) throw new Error("browserAttachEndpoint is missing");
+  let parsed: URL;
+  try { parsed = new URL(value); }
+  catch { throw new Error("browserAttachEndpoint is not a valid URL"); }
+  if (parsed.protocol !== "http:") throw new Error("browserAttachEndpoint must use http://");
+  const host = parsed.hostname.replace(/^\[|\]$/g, "");
+  if (host !== "127.0.0.1" && host !== "localhost" && host !== "::1") {
+    throw new Error("browserAttachEndpoint must use a loopback address");
+  }
+  const port = Number(parsed.port);
+  if (!parsed.port || !Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error("browserAttachEndpoint must contain an explicit loopback port");
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash
+    || (parsed.pathname !== "/" && parsed.pathname !== "")) {
+    throw new Error("browserAttachEndpoint must contain only a loopback host and explicit port");
+  }
+  return parsed.origin;
 }
 
 export function getConfigDir(): string {
@@ -419,8 +442,16 @@ function parseConfig(value: unknown, path: string): AppConfig {
     throw new Error(`Invalid subagentProtocol in ${path}`);
   }
   if (parsed.host !== "127.0.0.1") throw new Error("The Responses proxy must bind to 127.0.0.1");
-  if (parsed.browserHost !== "managed-chrome" && parsed.browserHost !== "launcher") {
+  if (parsed.browserHost !== "managed-chrome" && parsed.browserHost !== "launcher" && parsed.browserHost !== "attached-chrome") {
     throw new Error(`Invalid browserHost in ${path}`);
+  }
+  if (parsed.browserHost === "attached-chrome") {
+    if (typeof parsed.browserAttachEndpoint !== "string" || !parsed.browserAttachEndpoint.trim()) {
+      throw new Error(`attached-chrome requires browserAttachEndpoint in ${path}`);
+    }
+    parsed.browserAttachEndpoint = assertLoopbackBrowserAttachEndpoint(parsed.browserAttachEndpoint);
+  } else if (parsed.browserAttachEndpoint !== undefined) {
+    throw new Error(`browserAttachEndpoint is only valid for attached-chrome in ${path}`);
   }
   const browserInteractionMode = parsed.browserInteractionMode ?? "automatic";
   if (browserInteractionMode !== "automatic" && browserInteractionMode !== "manual") {
@@ -441,8 +472,9 @@ function parseConfig(value: unknown, path: string): AppConfig {
     throw new Error(`Invalid autoApproveToolCalls in ${path}`);
   }
   const requiredStrings: Array<keyof AppConfig> = [
-    "appName", "chromeExecutablePath", "storageStatePath", "brokerSocketPath", "controlToken",
+    "appName", "chromeExecutablePath", "brokerSocketPath", "controlToken",
   ];
+  if (parsed.browserHost !== "attached-chrome") requiredStrings.push("storageStatePath");
   for (const key of requiredStrings) {
     if (typeof parsed[key] !== "string" || !(parsed[key] as string).trim()) throw new Error(`Missing ${key} in ${path}`);
   }
@@ -584,6 +616,9 @@ function parseConfig(value: unknown, path: string): AppConfig {
     experimentalFreshConversationPerTurn,
     useSavedChats,
     zeroRiskProEnabled,
+    storageStatePath: parsed.browserHost === "attached-chrome"
+      ? (typeof parsed.storageStatePath === "string" ? parsed.storageStatePath : "")
+      : parsed.storageStatePath!,
   } as AppConfig;
 }
 
@@ -627,6 +662,7 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       browserInteractionMode: config.browserInteractionMode,
       browserHost: config.browserHost,
       browserHostDescriptorPath: config.browserHostDescriptorPath,
+      ...(config.browserAttachEndpoint ? { browserAttachEndpoint: config.browserAttachEndpoint } : {}),
       storageStatePath: config.storageStatePath,
       chromeExecutablePath: config.chromeExecutablePath,
       brokerSocketPath: config.brokerSocketPath,

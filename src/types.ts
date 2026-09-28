@@ -268,10 +268,12 @@ export interface CodexProviderConfig {
     appName?: string;
     /** Whether ChatGPT DOM interaction is automatic or explicitly driven by the user. */
     browserInteractionMode?: "automatic" | "manual";
-    /** Explicit browser owner. Launcher mode attaches to the embedded Electron ChatGPT surface. */
-    browserHost?: "managed-chrome" | "launcher";
+    /** Explicit browser owner. Launcher attaches to Electron; attached-chrome attaches to an already-running ordinary Chrome. */
+    browserHost?: "managed-chrome" | "launcher" | "attached-chrome";
     /** Owner-only descriptor containing the launcher's loopback CDP and control endpoints. */
     browserHostDescriptorPath?: string;
+    /** Loopback CDP HTTP endpoint of an already-running ordinary Chrome. attached-chrome only. */
+    browserAttachEndpoint?: string;
     /** Explicit browser-helper bundle. DEV builds current source; the launcher still supplies Electron-as-Node. */
     browserHelperScriptPath?: string;
     /** Explicit private diagnostic root for isolated harnesses. */

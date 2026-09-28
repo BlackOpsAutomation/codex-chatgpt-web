@@ -235,6 +235,9 @@ async function loginCommand(args: string[]): Promise<void> {
     if (config.browserHost === "launcher") {
       throw new Error("ChatGPT login is owned by the launcher; open Codex Web GPT and use its Sign in step");
     }
+    if (config.browserHost === "attached-chrome") {
+      throw new Error("ChatGPT login is owned by the external Chrome session; attached-chrome does not import or replace it");
+    }
     const result = await loginToChatGpt(config);
     stdout.write(`ChatGPT login stored at ${result.storageStatePath}\n`);
     return;
@@ -596,6 +599,8 @@ async function main(): Promise<void> {
         await inspectLauncherBrowserHost(config.browserHostDescriptorPath!);
         stdout.write("Playwright can reach the authenticated ChatGPT surface embedded in the launcher.\n");
       }
+    } else if (config.browserHost === "attached-chrome") {
+      stdout.write("attached-chrome uses an external loopback CDP endpoint. This check does not connect, launch Chrome, or prove authentication.\n");
     } else {
       await checkBrowserEngine(config);
       stdout.write("Playwright can launch the configured Chrome executable.\n");
