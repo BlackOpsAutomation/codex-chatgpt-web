@@ -2742,13 +2742,18 @@ export class ChatGptBrowserWorker {
     let count = 0;
     while (Date.now() < deadline) {
       throwIfPromptAttachmentAborted(abortSignal);
-      count = await withBrowserTurnAbort(
-        withChatGptBrowserObservationTimeout(
-          composers.count(),
-          Math.max(1, Math.min(CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, deadline - Date.now())),
-        ),
-        abortSignal,
-      );
+      try {
+        count = await withBrowserTurnAbort(
+          withChatGptBrowserObservationTimeout(
+            composers.count(),
+            Math.max(1, Math.min(CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, deadline - Date.now())),
+          ),
+          abortSignal,
+        );
+      } catch (error) {
+        // Hydration can stall one count() without answering. Retry only that probe timeout.
+        if (!(error instanceof ChatGptBrowserObservationTimeoutError)) throw error;
+      }
       if (count === 1) return composers.first();
       await withBrowserTurnAbort(
         new Promise(resolveSleep => setTimeout(resolveSleep, 50)),

@@ -1171,6 +1171,121 @@ test("active composer resolution waits for exactly one visible editor", async ()
   expect(await activeComposer.call({}, page, 500)).toBe(composer);
 });
 
+test("active composer retries a stalled observation until one visible editor appears", async () => {
+  const composer = { id: "active" };
+  const observations: Array<"timeout" | "ready"> = ["timeout", "ready"];
+  const page = {
+    locator: () => ({
+      filter: (options: { visible: boolean }) => {
+        expect(options).toEqual({ visible: true });
+        return {
+          count: async () => {
+            const observation = observations.shift();
+            if (observation === "timeout") throw new ChatGptBrowserObservationTimeoutError(5_000);
+            return 1;
+          },
+          first: () => composer,
+        };
+      },
+    }),
+  };
+  const activeComposer = (ChatGptBrowserWorker.prototype as unknown as {
+    activeComposer(page: unknown, timeoutMs?: number, abortSignal?: AbortSignal): Promise<unknown>;
+  }).activeComposer;
+  const started = Date.now();
+
+  expect(await activeComposer.call({}, page, 1_000)).toBe(composer);
+  expect(observations).toEqual([]);
+  expect(Date.now() - started).toBeGreaterThanOrEqual(40);
+  expect(Date.now() - started).toBeLessThan(1_000);
+});
+
+test("active composer does not retry an unrelated observation failure", async () => {
+  const failure = new Error("target closed");
+  let observations = 0;
+  const page = {
+    locator: () => ({
+      filter: () => ({
+        count: async () => {
+          observations += 1;
+          throw failure;
+        },
+        first: () => ({ id: "active" }),
+      }),
+    }),
+  };
+  const activeComposer = (ChatGptBrowserWorker.prototype as unknown as {
+    activeComposer(page: unknown, timeoutMs?: number): Promise<unknown>;
+  }).activeComposer;
+  const started = Date.now();
+
+  await expect(activeComposer.call({}, page, 2_000)).rejects.toBe(failure);
+  expect(observations).toBe(1);
+  expect(Date.now() - started).toBeLessThan(200);
+});
+
+test("active composer keeps its overall deadline when every observation stalls", async () => {
+  let observations = 0;
+  const page = {
+    locator: () => ({
+      filter: () => ({
+        count: () => {
+          observations += 1;
+          return new Promise<number>(() => {});
+        },
+        first: () => ({ id: "active" }),
+      }),
+    }),
+  };
+  const activeComposer = (ChatGptBrowserWorker.prototype as unknown as {
+    activeComposer(page: unknown, timeoutMs?: number): Promise<unknown>;
+  }).activeComposer;
+  const started = Date.now();
+  const error = await activeComposer.call({}, page, 150).catch(cause => cause);
+  const elapsed = Date.now() - started;
+
+  expect(error).toBeInstanceOf(Error);
+  if (!(error instanceof Error)) throw error;
+  expect(error).not.toBeInstanceOf(ChatGptBrowserObservationTimeoutError);
+  expect(error.message).toContain("composer is unavailable");
+  const cause = error.cause;
+  expect(cause).toBeInstanceOf(Error);
+  if (!(cause instanceof Error)) throw cause;
+  expect(cause.message).toBe("Visible ChatGPT composer count was 0");
+  expect(observations).toBe(1);
+  expect(elapsed).toBeGreaterThanOrEqual(150);
+  expect(elapsed).toBeLessThan(1_000);
+});
+
+test("active composer cancellation still aborts a stalled observation", async () => {
+  const controller = new AbortController();
+  let observations = 0;
+  const page = {
+    locator: () => ({
+      filter: () => ({
+        count: () => {
+          observations += 1;
+          return new Promise<number>((_resolve, reject) => {
+            controller.signal.addEventListener("abort", () => {
+              reject(new DOMException("count aborted", "AbortError"));
+            }, { once: true });
+          });
+        },
+        first: () => ({ id: "active" }),
+      }),
+    }),
+  };
+  const activeComposer = (ChatGptBrowserWorker.prototype as unknown as {
+    activeComposer(page: unknown, timeoutMs?: number, abortSignal?: AbortSignal): Promise<unknown>;
+  }).activeComposer;
+  const pending = activeComposer.call({}, page, 5_000, controller.signal);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  controller.abort();
+
+  await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  expect(observations).toBe(1);
+});
+
 test("prompt verification accepts Lexical NBSP preservation without weakening other mismatches", async () => {
   // Lexical may preserve indentation as alternating NBSP and ASCII spaces while keeping the same
   // UTF-16 length; that representation is equivalent only for whitespace runs.
