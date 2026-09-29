@@ -61,3 +61,4 @@ Durable rules for coding agents in this checkout. This is not a runtime inventor
 - Do not modify `/home/wintersun/dev/omp-chatgpt-web-bridge` merely because browser ownership changes.
 - Runtime helpers under `~/.chatgpt-omp` are outside this Git repository.
 - Do not include runtime, auth, or profile artifacts in commits.
+- ChatGPT Project Source documents are externally maintained context; absence from the host filesystem is normal. Use supplied project/task context instead. Do not search for, create, copy, synchronize, edit, or maintain local copies unless the user explicitly provides a concrete filesystem path and instructs you to operate on that file.
