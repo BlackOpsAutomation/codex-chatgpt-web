@@ -93,6 +93,14 @@ import {
   chatGptStoppedThinkingError,
 } from "./adapter-error";
 import {
+  attachedConversationLeaseRequested,
+  attachedConversationIdentity,
+  attachedLeaseMarker,
+  readAttachedLeaseMarker,
+  readAttachedConversationAnchor,
+  stampAttachedLeaseMarker,
+} from "./attached-conversation-lease";
+import {
   ChatGptLunaCheckpointStream,
   type CapturedChatGptLunaCheckpoint,
 } from "./rolling-checkpoint";
@@ -2245,6 +2253,17 @@ export class ChatGptBrowserWorker {
   private launcherHelper?: LauncherBrowserHelperClient;
   private maintenanceTail: Promise<void> = Promise.resolve();
   private readonly activeRuns = new Map<string, Promise<string>>();
+  private readonly attachedOwnedPages = new Map<string, {
+    page?: Page;
+    marker: string;
+    identity?: string;
+    anchor?: string;
+    acquisition?: Promise<void>;
+    closing?: Promise<void>;
+    busy: boolean;
+    cancelled: boolean;
+  }>();
+  private closing = false;
 
   private constructor(private readonly config: ResolvedBrowserConfig) {}
 
@@ -2301,6 +2320,7 @@ export class ChatGptBrowserWorker {
   }
 
   run(turn: BrowserTurn): Promise<string> {
+    if (this.closing) return Promise.reject(new Error("ChatGPT browser worker is closing"));
     if (this.activeRuns.has(turn.traceId)) {
       return Promise.reject(new Error(`Duplicate ChatGPT web browser turn: ${turn.traceId}`));
     }
@@ -2363,6 +2383,8 @@ export class ChatGptBrowserWorker {
   }
 
   async close(): Promise<void> {
+    this.closing = true;
+    const drainingOwnedPages = this.releaseOwnedAttachedPages();
     if (this.launcherHelper) {
       const helper = this.launcherHelper;
       this.launcherHelper = undefined;
@@ -2370,6 +2392,8 @@ export class ChatGptBrowserWorker {
     }
     await Promise.allSettled([...this.activeRuns.values()]);
     await this.maintenanceTail;
+    await drainingOwnedPages;
+    await this.releaseOwnedAttachedPages();
     const browser = this.browser;
     this.browser = undefined;
     this.context = undefined;
@@ -2381,6 +2405,9 @@ export class ChatGptBrowserWorker {
     // Playwright artifacts. This releases launcher and attached-chrome connections without
     // signaling the external Chrome process.
     if (browser) await browser.close();
+    // forProvider caches workers; close disconnects but must not permanently disable
+    // later managed or launcher turns using that same worker instance.
+    this.closing = false;
   }
 
   private async runStage<T>(
@@ -4661,9 +4688,119 @@ export class ChatGptBrowserWorker {
     return redactChatGptUiDiagnostic(JSON.stringify({ response: responseState, overlays }));
   }
 
+  async releaseAttachedConversation(conversationKey: string): Promise<void> {
+    const owned = this.attachedOwnedPages.get(conversationKey);
+    if (!owned) return;
+    owned.cancelled = true;
+    owned.closing ??= (async () => {
+      await owned.acquisition?.catch(() => {});
+      if (owned.page && !owned.page.isClosed()) await owned.page.close();
+      if (this.attachedOwnedPages.get(conversationKey) === owned) {
+        this.attachedOwnedPages.delete(conversationKey);
+      }
+    })();
+    try {
+      await owned.closing;
+    } catch (error) {
+      // Keep the cancelled page registered for a later cleanup attempt.
+      owned.closing = undefined;
+      throw error;
+    }
+  }
+
+  private async releaseOwnedAttachedPages(): Promise<void> {
+    await Promise.all([...this.attachedOwnedPages.keys()].map(key => this.releaseAttachedConversation(key)));
+  }
+
+  private async assertAttachedConversation(
+    key: string,
+    owned: { page?: Page; marker: string; identity?: string; anchor?: string; cancelled: boolean },
+    page: Page,
+  ): Promise<void> {
+    if (owned.cancelled || this.attachedOwnedPages.get(key) !== owned || page.isClosed()
+      || !owned.identity || !owned.anchor
+      || attachedConversationIdentity(page.url()) !== owned.identity
+      || await readAttachedLeaseMarker(page) !== owned.marker
+      || await readAttachedConversationAnchor(page, CHATGPT_USER_TURN_SELECTOR, owned.anchor) !== owned.anchor
+      || attachedConversationIdentity(page.url()) !== owned.identity
+      || owned.cancelled) {
+      throw chatGptRetainedConversationUnavailableError();
+    }
+  }
+
+  /**
+   * Reserve the key before any page-creation await. A release cancels pending
+   * acquisition and drains only the page created for this key, never another tab.
+   */
+  private async runAttachedOwnedTurn(turn: BrowserTurn): Promise<string> {
+    const key = turn.conversationKey ?? "";
+    if (turn.requireRetainedConversation && !turn.prepareResume) {
+      throw new Error("Attached conversation continuation requires a continuation prompt");
+    }
+    let owned = this.attachedOwnedPages.get(key);
+    if (turn.requireRetainedConversation) {
+      if (!owned || owned.cancelled || owned.busy || !owned.page || !owned.identity || !owned.anchor) {
+        throw chatGptRetainedConversationUnavailableError();
+      }
+      owned.busy = true;
+    } else {
+      if (owned) throw new Error(`Attached conversation lease is already open: ${key}`);
+      owned = { marker: attachedLeaseMarker(key), busy: true, cancelled: false };
+      this.attachedOwnedPages.set(key, owned);
+    }
+    const lease = owned;
+    try {
+      let page = lease.page;
+      if (!page) {
+        lease.acquisition = this.pageForNewTurn().then(created => {
+          lease.page = created;
+        });
+        await lease.acquisition;
+        page = lease.page;
+      }
+      if (!page || lease.cancelled || this.closing) throw chatGptRetainedConversationUnavailableError();
+      if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+      if (turn.requireRetainedConversation) {
+        await this.assertAttachedConversation(key, lease, page);
+      }
+      const text = await this.runBrowserTurn(
+        turn, undefined, undefined, turn.requireRetainedConversation === true, false, page,
+      );
+      if (lease.cancelled || page.isClosed()) throw chatGptRetainedConversationUnavailableError();
+      if (turn.requireRetainedConversation) {
+        await this.assertAttachedConversation(key, lease, page);
+      } else {
+        const identity = attachedConversationIdentity(page.url());
+        const anchor = await readAttachedConversationAnchor(page, CHATGPT_USER_TURN_SELECTOR);
+        if (!identity || !anchor) throw chatGptRetainedConversationUnavailableError();
+        await stampAttachedLeaseMarker(page, lease.marker);
+        lease.identity = identity;
+        lease.anchor = anchor;
+        await this.assertAttachedConversation(key, lease, page);
+      }
+      if (turn.retainConversation !== true) await this.releaseAttachedConversation(key);
+      return text;
+    } catch (error) {
+      await this.releaseAttachedConversation(key);
+      throw error;
+    } finally {
+      lease.busy = false;
+    }
+  }
+
   private async runExclusive(turn: BrowserTurn): Promise<string> {
+    if (this.closing) throw new Error("ChatGPT browser worker is closing");
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
-    if (this.config.browserHost !== "launcher") return this.runBrowserTurn(turn);
+    if (this.config.browserHost !== "launcher") {
+      if (this.config.browserHost === "attached-chrome"
+        && (turn.retainConversation === true || turn.requireRetainedConversation === true)) {
+        if (!attachedConversationLeaseRequested(this.config.browserHost, turn)) {
+          throw new Error("Attached conversation lease key is invalid");
+        }
+        return this.runAttachedOwnedTurn(turn);
+      }
+      return this.runBrowserTurn(turn);
+    }
 
     const lease = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
       phase: "start",
@@ -4770,6 +4907,7 @@ export class ChatGptBrowserWorker {
     maintenancePage?: Page,
     reuseConversation = false,
     trackUsage = false,
+    ownedPage?: Page,
   ): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     if ((turn.externalProgress !== undefined) !== (turn.completionFence !== undefined)) {
@@ -4868,6 +5006,11 @@ export class ChatGptBrowserWorker {
         ? undefined
         : Date.now() + this.config.turnTimeoutMs;
       let page = await this.runStage(turn.traceId, "browser_page", browserStageTimeouts.browserPage, async (abortSignal) => {
+        if (ownedPage) {
+          if (ownedPage.isClosed()) throw chatGptRetainedConversationUnavailableError();
+          if (abortSignal.aborted) throw new DOMException("ChatGPT browser page acquisition aborted", "AbortError");
+          return ownedPage;
+        }
         if (maintenancePage) return maintenancePage;
         if (!launcherSurfaceId) {
           const managed = await this.pageForNewTurn();
@@ -4891,7 +5034,7 @@ export class ChatGptBrowserWorker {
         await waitForOperationalChatGptViewport(connection.page, abortSignal);
         return connection.page;
       });
-      if (!maintenancePage && !launcherSurfaceId) managedPage = page;
+      if (!maintenancePage && !launcherSurfaceId && !ownedPage) managedPage = page;
       diagnosticPage = page;
       const rebindLauncherPage = async (
         attempt: number,
@@ -5006,6 +5149,13 @@ export class ChatGptBrowserWorker {
           + ` maxStageMessageTokens=${maxStageMessageTokens} maxStageChars=${maxStageChars}`,
         );
       }
+      const assertRetainedPage = async () => {
+        if (!ownedPage || !reuseConversation) return;
+        const owned = turn.conversationKey ? this.attachedOwnedPages.get(turn.conversationKey) : undefined;
+        if (!owned || owned.page !== page) throw chatGptRetainedConversationUnavailableError();
+        await this.assertAttachedConversation(turn.conversationKey!, owned, page);
+      };
+      await assertRetainedPage();
       if (!reuseConversation) {
         await this.runStage(
           turn.traceId,
@@ -5101,6 +5251,7 @@ export class ChatGptBrowserWorker {
               undefined,
               { onSubmitted: recordStageUsage, onSendActivated: async () => {
                 await this.assertSelectedEffort(page, mode);
+                await assertRetainedPage();
                 submissionRejection.begin(page);
               } },
               undefined,
@@ -5268,6 +5419,7 @@ export class ChatGptBrowserWorker {
             await this.assertSelectedEffort(page, mode);
             submissionRejection.begin(page);
             await turn.onSendActivated?.();
+            await assertRetainedPage();
           } },
           completionTracker,
           launcherObservationRecovery

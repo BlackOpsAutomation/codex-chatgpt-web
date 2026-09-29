@@ -128,8 +128,23 @@ or `http://[::1]:<port>`. The worker calls `chromium.connectOverCDP`, uses the e
 context, and does not call `browser.newContext({ storageState })`. Session inspection prefers an
 existing `https://chatgpt.com` page by URL and otherwise opens a new page in that same context.
 Each automatic turn opens its own page in that context so a previous transcript is not reused, and
-closes only that page. `browser.close()` disconnects the CDP transport and does not terminate the
-external Chrome process. `storage-state.json` and its verification marker are not required.
+closes only that page. An explicit owned conversation lease is the exception: a turn that sets
+`conversationKey` and `retainConversation` or `requireRetainedConversation` creates that page with
+`context.newPage()` and keeps it for that key. The key is reserved before page acquisition; concurrent
+first turns and continuations cannot enter an acquiring or busy lease. Release during acquisition
+drains and closes the eventual page, and worker shutdown drains active turns before disconnecting CDP.
+After the first successful turn, retention binds the first accepted user turn's stable outer DOM
+identity, the page's document marker, and the observed ChatGPT route. Saved conversations bind the
+exact `/c/<id>` route; Temporary Chat may remain at `/?temporary-chat=true`, so URL alone never
+identifies its conversation. Continuation reuses the same page, skips new-chat navigation, and
+checks the route, original outer turn identity, and document marker before work, before Send, and
+after completion. A same-document SPA conversation change fails closed even if the marker remains.
+Model-family verification still runs before Send. Missing or ambiguous outer identity, changed route,
+a closed page, missing marker, abort, or failed turn releases that lease instead of opening a
+replacement chat. The lease never adopts an existing tab. Release and worker close touch only pages
+the lease created; `browser.close()`
+only disconnects CDP and does not terminate external Chrome. `storage-state.json` and its verification
+marker are not required.
 Authentication bootstrap stays outside this mode: a CDP connection alone is not authenticated-session
 evidence. Observable page checks, including the visible composer, remain the session proof.
 
