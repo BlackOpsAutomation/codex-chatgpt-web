@@ -83,6 +83,28 @@ export function chatGptModelFamilyMatches(
     && (effort === "max" ? /^Pro$/i.test(state.mode) : !/^Pro$/i.test(state.mode)));
 }
 
+/** The power picker can omit the version from its announcement while its checked
+ * radio still names the family. Accept that surface only for an explicit Sol row
+ * and the exact non-Pro effort announced by the same slider's owner.
+ */
+async function versionlessSolEffortMatches(
+  menu: EffortMenu,
+  family: ChatGptWebModelFamily,
+  effort: ChatGptWebAdapterEffort,
+  effortIndex: number,
+  optionCount: number,
+  descriptions: readonly string[],
+): Promise<boolean> {
+  if (family !== "5.6" || effort === "max") return false;
+  const label = { low: "Instant", medium: "Medium", high: "High", xhigh: "Extra High" }[effort];
+  if (descriptions[0]?.trim() !== `${label}, ${effortIndex + 1} of ${optionCount}.`
+    || descriptions.slice(1).some(text => /\b(?:GPT[-\s]?)?\d+(?:\.\d+)?\b|\bPro\b/i.test(text))) return false;
+  const sol = menu.menu.getByRole("menuitemradio", {
+    name: /^GPT[-\s]?5\.6\s+Sol$/i, exact: true, includeHidden: true,
+  });
+  return await sol.count() === 1 && await sol.getAttribute("aria-checked") === "true";
+}
+
 export async function assertChatGptModelFamily(
   menu: EffortMenu,
   family: ChatGptWebModelFamily,
@@ -102,7 +124,11 @@ export async function assertChatGptModelFamily(
       (element.getAttribute("aria-describedby") ?? "").split(/\s+/).filter(Boolean)
         .map(id => element.ownerDocument.getElementById(id)?.textContent ?? "")
     ));
-    if (checked && state && state.value === state.min + effortIndex && chatGptModelFamilyMatches(descriptions, family, effort)) return;
+    if (checked && state && state.value === state.min + effortIndex
+      && (chatGptModelFamilyMatches(descriptions, family, effort)
+        || await versionlessSolEffortMatches(
+          menu, family, effort, effortIndex, state.max - state.min + 1, descriptions,
+        ))) return;
     if (Date.now() >= deadline) break;
     await new Promise(resolve => setTimeout(resolve, 50));
   } while (true);

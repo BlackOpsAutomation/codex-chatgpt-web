@@ -1,7 +1,58 @@
 import { expect, test } from "bun:test";
-import { chromium } from "playwright-core";
+import { chromium, type Locator } from "playwright-core";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
 import { detectChatGptAccountCapabilities } from "../src/chatgpt-session";
+import { assertChatGptModelFamily } from "../src/adapters/chatgpt-web/model-selection";
+
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("family gate accepts the checked Sol row with a versionless power announcement, but never ambiguous evidence", async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+  try {
+    const page = await browser.newPage();
+    page.setDefaultTimeout(15_000);
+    await page.setContent('<div id="picker" role="menu"></div>');
+    const scenarios = [
+      { name: "current Sol Instant", rows: ['<div role="menuitemradio" aria-checked="true">GPT-5.6 Sol</div>', '<div role="menuitemradio" aria-checked="false">GPT-5.5</div>'],
+        description: "Instant, 1 of 1.", family: "5.6", effort: "low", index: 0, max: 0, valid: true },
+      { name: "wrong checked family", rows: ['<div role="menuitemradio" aria-checked="false">GPT-5.6 Sol</div>', '<div role="menuitemradio" aria-checked="true">GPT-5.5</div>'],
+        description: "Instant, 1 of 1.", family: "5.6", effort: "low", index: 0, max: 0, valid: false },
+      { name: "missing family", rows: ['<div role="menuitemradio" aria-checked="true">GPT-5.5</div>'],
+        description: "Instant, 1 of 1.", family: "5.6", effort: "low", index: 0, max: 0, valid: false },
+      { name: "duplicate family rows", rows: Array(2).fill('<div role="menuitemradio" aria-checked="true">GPT-5.6 Sol</div>'),
+        description: "Instant, 1 of 1.", family: "5.6", effort: "low", index: 0, max: 0, valid: false },
+      { name: "wrong announced effort", rows: ['<div role="menuitemradio" aria-checked="true">GPT-5.6 Sol</div>'],
+        description: "Pro, 1 of 1.", family: "5.6", effort: "low", index: 0, max: 0, valid: false },
+      { name: "contradictory model description", rows: ['<div role="menuitemradio" aria-checked="true">GPT-5.6 Sol</div>'],
+        description: "Instant, 1 of 1.", extra: "GPT-6 Astra Pro", family: "5.6", effort: "low", index: 0, max: 0, valid: false },
+      { name: "Latest staging retains GPT-6 behavior", rows: ['<div role="menuitemradio" aria-checked="true">Latest</div>'],
+        description: "5.6 Extra High, 4 of 4.", family: "6", effort: "xhigh", index: 3, max: 3, valid: true },
+      { name: "GPT-6 Pro remains version-bound", rows: ['<div role="menuitemradio" aria-checked="true">GPT-6 Pro</div>'],
+        description: "6 Pro, 5 of 5.", family: "6", effort: "max", index: 4, max: 4, valid: true },
+      { name: "Sol Pro remains version-bound", rows: ['<div role="menuitemradio" aria-checked="true">GPT-5.6 Sol Pro</div>'],
+        description: "GPT-5.6 Sol Pro, 5 of 5.", family: "5.6", effort: "max", index: 4, max: 4, valid: true },
+      { name: "versionless Pro is not inferred", rows: ['<div role="menuitemradio" aria-checked="true">GPT-5.6 Sol Pro</div>'],
+        description: "Pro, 5 of 5.", family: "5.6", effort: "max", index: 4, max: 4, valid: false },
+    ] as const;
+    for (const scenario of scenarios) {
+      await page.locator("#picker").evaluate((menu, html) => { menu.innerHTML = html; }, `${scenario.rows.join("")}
+        <span id="announcement">${scenario.description}</span>
+        <span id="help">Use Left and Right arrow keys to adjust power.</span>
+        ${"extra" in scenario ? `<span id="extra">${scenario.extra}</span>` : ""}
+        <div role="menuitem" aria-describedby="announcement help ${"extra" in scenario ? "extra" : ""}">
+          <div data-model-picker-power-slider><span role="slider" aria-hidden="true"
+            aria-valuemin="0" aria-valuemax="${scenario.max}" aria-valuenow="${scenario.index}"></span></div>
+        </div>`);
+      const menu = { menu: page.locator("#picker"), slider: page.locator('[role="slider"]') } as unknown as Parameters<typeof assertChatGptModelFamily>[0];
+      try {
+        await (scenario.valid
+          ? expect(assertChatGptModelFamily(menu, scenario.family, scenario.effort, scenario.index)).resolves.toBeUndefined()
+          : expect(assertChatGptModelFamily(menu, scenario.family, scenario.effort, scenario.index))
+            .rejects.toMatchObject({ code: "model_version_unavailable" }));
+      } catch (error) {
+        throw new Error(`${scenario.name}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+      }
+    }
+  } finally { await browser.close(); }
+}, 180_000);
 
 for (const modern of [false, true])
 test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`model selection reuses the ${modern ? "power" : "classic"} picker without racing Escape cleanup`, async () => {
@@ -63,7 +114,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`real slider ${scenario} keep
             +'<span role="slider" aria-hidden="true" aria-valuemin="0" aria-valuemax="'+max+'" aria-valuenow="'+value+'"></span></span>';
         }
         control.onclick=()=>{
-          opens++; menu.hidden=false; control.setAttribute('aria-expanded','true');
+          opens++; control.dataset.opens=String(opens); menu.hidden=false; control.setAttribute('aria-expanded','true');
           if(opens>1&&(scenario==='shrink'||scenario==='pro-disappears'))max=3;
           value=Math.min(value,max); render(scenario==='hydrate'&&opens===1?4:max+1);
           if(scenario==='hydrate'&&opens===1)setTimeout(()=>{max=3;render()},100);
@@ -79,11 +130,35 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`real slider ${scenario} keep
     } else {
       const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
       const effort = scenario === "pro-disappears" ? "max" : scenario === "locked" ? "high" : "xhigh";
-      const result = worker.selectModelAndEffort(page, "gpt-5.6-sol", effort, {
-        localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true,
-      });
-      if (scenario === "shrink") expect((await result).selection.label).toBe("Extra High");
-      else await expect(result).rejects.toMatchObject({ retryable: false });
+      // These cases test the second slider reading, not Chrome's physical-click
+      // navigation waiter. On this synthetic control the click event can run
+      // while Playwright still times out awaiting a navigation that never occurs.
+      const prototype = Object.getPrototypeOf(page.locator("button")) as { click: Locator["click"] };
+      const physicalClick = prototype.click;
+      if (scenario === "locked" || scenario === "pro-disappears") {
+        prototype.click = function (this: Locator, options) {
+          return this.page() === page && this.toString().includes('button[aria-haspopup="menu"][data-tone="neutral"]')
+            ? this.dispatchEvent("click")
+            : physicalClick.call(this, options);
+        };
+      }
+      try {
+        const result = worker.selectModelAndEffort(page, "gpt-5.6-sol", effort, {
+          localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true,
+        });
+        if (scenario === "shrink") expect((await result).selection.label).toBe("Extra High");
+        else {
+          await expect(result).rejects.toMatchObject({
+            code: scenario === "locked" ? "chatgpt_effort_locked" : "upstream_server_error",
+            retryable: false,
+          });
+          expect(await page.locator("button").getAttribute("data-opens")).toBe("2");
+          if (scenario === "locked") expect(await page.locator('[data-locked="true"]').count()).toBe(1);
+          else expect(await page.locator('[role="slider"]').getAttribute("aria-valuemax")).toBe("3");
+        }
+      } finally {
+        prototype.click = physicalClick;
+      }
     }
     expect(await page.locator('#prompt-textarea').innerText()).toBe("Draft");
     await page.close();

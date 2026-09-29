@@ -30,6 +30,9 @@ launcher-owned codex-chatgpt-web daemon
 - Named Sol/Pro routes select the exact browser family and verify it again before every Send.
   Latest must identify version 6 for a GPT-6 Pro response. Its existing lower-effort multipart
   acknowledgements identify 5.6, then the final part returns to verified 6 Pro. No version fallback.
+  If a power-picker announcement omits its version, non-Pro Sol requires the
+  explicitly checked `GPT-5.6 Sol` radio and the matching effort announcement;
+  absent or conflicting evidence still blocks Send.
 - Pre-6.0 slugs remain hidden catalog entries with their original fixed bindings, including the
   unpinned `chatgpt-web/pro`. They keep old tasks and cached selections working. The existing release
   upgrade reruns integration setup and invalidates the model cache; Codex must restart for the new
