@@ -178,20 +178,28 @@ export function parseChatGptEffortSliderState(
 export async function readChatGptEffortSnapshot(
   sliderContainer: Locator,
   timeoutMs = 1_000,
-): Promise<ChatGptEffortSliderState & { available: boolean[] }> {
+): Promise<ChatGptEffortSliderState & { available: boolean[]; disabled: boolean }> {
   const deadline = Date.now() + timeoutMs;
   do {
-    // Read the range, selection and locks in one DOM revision. Separate Playwright
-    // reads can straddle hydration and combine a five-step range with four ticks.
+    // Read the range, selection, locks, and owning control state in one DOM revision. Separate
+    // Playwright reads can straddle hydration and combine a five-step range with four ticks.
     const snapshot = await sliderContainer.evaluate(container => {
       const sliders = container.querySelectorAll('[role="slider"]');
       const slider = sliders.length === 1 ? sliders[0] : undefined;
+      const owner = container.querySelector('[data-orientation="horizontal"]');
+      const disabled = container.getAttribute("aria-disabled") === "true"
+        || container.hasAttribute("disabled")
+        || slider?.getAttribute("aria-disabled") === "true"
+        || Boolean(slider?.hasAttribute("disabled"))
+        || owner?.getAttribute("aria-disabled") === "true"
+        || Boolean(owner?.hasAttribute("disabled"));
       const power = container.hasAttribute("data-model-picker-power-slider")
-        && Boolean(container.querySelector('[data-orientation="horizontal"][aria-disabled="false"]'));
+        && owner?.getAttribute("aria-disabled") === "false";
       return {
         min: slider?.getAttribute("aria-valuemin") ?? null,
         max: slider?.getAttribute("aria-valuemax") ?? null,
         value: slider?.getAttribute("aria-valuenow") ?? null,
+        disabled,
         locks: Array.from(container.querySelectorAll("[data-selected]"), tick =>
           tick.getAttribute("data-locked") ?? (power ? "false" : null)),
       };
@@ -200,7 +208,11 @@ export async function readChatGptEffortSnapshot(
     if (!state) throw new Error("ChatGPT effort slider exposed an invalid ARIA range");
     if (snapshot.locks.some(lock => lock !== "true" && lock !== "false")) break;
     if (snapshot.locks.length === state.max - state.min + 1) {
-      return { ...state, available: snapshot.locks.map(lock => lock === "false") };
+      return {
+        ...state,
+        available: snapshot.locks.map(lock => lock === "false"),
+        disabled: snapshot.disabled,
+      };
     }
     if (Date.now() >= deadline) break;
     await new Promise(resolve => setTimeout(resolve, 50));

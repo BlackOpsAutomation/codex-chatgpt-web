@@ -242,9 +242,23 @@ test("a transient effort control does not turn a Luna-only account into Sol", as
   expect(visibilityReads).toBe(2);
 });
 
-function reasoningPicker(options: { max?: string; locks?: Array<string | null>; delay?: number; missing?: boolean; loseSelectionOnClose?: boolean; power?: boolean; disabled?: string; staleAttributeMax?: string; maxAfterClose?: string; locksAfterClose?: Array<string | null> } = {}) {
-  let value = 0;
-  let opened = true;
+function reasoningPicker(options: {
+  max?: string;
+  locks?: Array<string | null>;
+  delay?: number;
+  missing?: boolean;
+  loseSelectionOnClose?: boolean;
+  power?: boolean;
+  disabled?: string;
+  staleAttributeMax?: string;
+  maxAfterClose?: string;
+  locksAfterClose?: Array<string | null>;
+  initialValue?: number;
+  closedInitially?: boolean;
+  announcement?: string;
+} = {}) {
+  let value = options.initialValue ?? 0;
+  let opened = options.closedInitially !== true;
   let closedOnce = false;
   const max = () => closedOnce ? options.maxAfterClose ?? options.max ?? "4" : options.max ?? "4";
   const keys: string[] = [];
@@ -255,7 +269,10 @@ function reasoningPicker(options: { max?: string; locks?: Array<string | null>; 
       signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
     }),
   };
-  const sliderControl = { press: async (key: string) => { keys.push(key); value += key === "ArrowRight" ? 1 : -1; } };
+  const sliderControl = {
+    press: async (key: string) => { keys.push(key); value += key === "ArrowRight" ? 1 : -1; },
+    evaluate: async () => [options.announcement ?? "5.6 Sol Extra High"],
+  };
   const slider = {
     isVisible: async () => false, // Live DOM: aria-hidden=true, zero-width semantic span.
     filter: () => { throw new Error("Semantic input must not be visibility-filtered"); },
@@ -294,7 +311,14 @@ function reasoningPicker(options: { max?: string; locks?: Array<string | null>; 
   };
   const composer = { filter() { return this; }, last() { return this; }, count: async () => 1, isEditable: async () => true, locator: () => ({ count: async () => 1, locator: () => control }) };
   const modelRows = { count: async () => 3, first() { return this; }, waitFor: async () => {}, nth: () => { throw new Error("Model rows are not effort choices"); } };
-  const menu = { filter() { return this; }, last() { return this; }, isVisible: async () => true, locator: () => modelRows };
+  const familyRadio = { count: async () => 1, getAttribute: async () => "true" };
+  const menu = {
+    filter() { return this; },
+    last() { return this; },
+    isVisible: async () => true,
+    locator: () => modelRows,
+    getByRole: () => familyRadio,
+  };
   const page = {
     url: () => "https://chatgpt.com/?temporary-chat=true",
     evaluate: async () => true,
@@ -436,5 +460,39 @@ test("Pro selection verifies the persisted hidden slider through its visible own
     else expect((await selection).selection.label).toBe("Pro");
     expect(fixture.keys).toEqual(["ArrowRight", "ArrowRight", "ArrowRight", "ArrowRight"]);
     expect(fixture.value()).toBe(loseSelectionOnClose ? 0 : 4);
+  }
+});
+test("requested pre-Send checks reject a disabled tier or incorrect effort announcement", async () => {
+  for (const scenario of [
+    { disabled: "false", announcement: "5.6 Sol Extra High", unavailable: false },
+    { disabled: "true", announcement: "5.6 Sol Extra High", unavailable: true },
+    { disabled: "false", announcement: "5.6 Sol High", unavailable: true },
+  ]) {
+    const fixture = reasoningPicker({
+      max: "3",
+      locks: ["false", "false", "false", "false"],
+      initialValue: 3,
+      closedInitially: true,
+      disabled: scenario.disabled,
+      announcement: scenario.announcement,
+    });
+    const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+      activeComposer: async () => fixture.composer,
+    }) as {
+      assertSelectedEffort(page: unknown, mode: unknown, verifyFamily?: boolean): Promise<void>;
+    };
+    const mode = {
+      effort: "xhigh",
+      uiEffortIndex: 3,
+      requestedModel: "gpt-5.6-sol",
+      modelFamily: "5.6",
+      selection: { url: fixture.page.url(), label: "Extra High" },
+    };
+    const assertion = worker.assertSelectedEffort(fixture.page, mode);
+    if (scenario.unavailable) {
+      await expect(assertion).rejects.toMatchObject({ code: "reasoning_not_available", retryable: false });
+    } else {
+      await expect(assertion).resolves.toBeUndefined();
+    }
   }
 });

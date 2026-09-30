@@ -11,13 +11,19 @@ import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter
 import { CHATGPT_STOPPED_THINKING_LABELS } from "../src/adapters/chatgpt-web/ui-labels";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { CHATGPT_CONNECTOR_NAME, DEV_CHATGPT_CONNECTOR_NAME, defaultChromeExecutable, legacyChatGptConnectorMigrationMessage } from "../src/config";
-import { CHATGPT_SEND_BUTTON_SELECTOR, parseChatGptEffortSliderState } from "../src/chatgpt-session";
+import { CHATGPT_EFFORT_CONTROL_SELECTOR, CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR, CHATGPT_SEND_BUTTON_SELECTOR, parseChatGptEffortSliderState } from "../src/chatgpt-session";
 import { ChatGptExternalTurnProgress, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
 import type { CodexProviderConfig } from "../src/types";
 import { compileChatGptWebPrompt, formatChatGptWebMultipartCommit, formatChatGptWebMultipartStage } from "../src/adapters/chatgpt-web/prompt";
 import { estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
 import { estimateTokens } from "../src/lib/token-estimate";
 import { chatGptHtmlToMarkdown } from "../src/adapters/chatgpt-web/markdown";
+import {
+  resolveRequestedChatGptMode,
+  requestedModelUnavailable,
+  requestedReasoningUnavailable,
+  selectChatGptModelFamily,
+} from "../src/adapters/chatgpt-web/model-selection";
 
 function personalizedTemporaryChatRole(
   _role: string,
@@ -4535,3 +4541,212 @@ test("a stage that spans a system sleep is not charged for the slept time", asyn
   await stage;
   expect(outcome).toEqual(["ChatGPT browser stage timed out: probe"]);
 }, 10_000);
+test("requested GPT-5.6 Sol selection requires the exact Sol row and verifies it before Send", async () => {
+  const actions: string[] = [];
+  let checked = false;
+  let rows = ["GPT-5.6 Sol"];
+  let requestedName: RegExp | undefined;
+  const radio = {
+    count: async () => rows.filter(name => requestedName?.test(name)).length,
+    getAttribute: async () => checked ? "true" : "false",
+    waitFor: async () => {
+      if (await radio.count() !== 1) throw new Error("exact Sol row is absent");
+      actions.push("radio-visible");
+    },
+    click: async () => {
+      if (await radio.count() !== 1) throw new Error("exact Sol row is absent");
+      actions.push("select-5.6-sol");
+      checked = true;
+    },
+  };
+  const absent = { count: async () => 0 };
+  const powerView = absent;
+  const trigger = {
+    count: async () => 1,
+    getAttribute: async () => "false",
+    click: async () => { actions.push("open-family-picker"); },
+  };
+  const menu = {
+    menu: {
+      getByRole: (_role: string, options: { name: RegExp }) => {
+        requestedName = options.name;
+        expect(options.name.test("GPT-5.6 Sol")).toBe(true);
+        expect(options.name.test("GPT-5.6 Sol Pro")).toBe(false);
+        return radio;
+      },
+      locator: (selector: string) => selector === "[data-model-picker-view]" ? powerView : trigger,
+    },
+  };
+  const activate = async () => {
+    expect(checked).toBe(true);
+    actions.push("reconfirm-open-picker");
+    return menu as never;
+  };
+  await selectChatGptModelFamily(menu as never, "5.6", activate, true);
+  expect(actions).toEqual(["open-family-picker", "radio-visible", "select-5.6-sol", "reconfirm-open-picker"]);
+  rows = ["GPT-5.6 Sol Pro"];
+  checked = false;
+  const previousActions = actions.length;
+  await expect(selectChatGptModelFamily(menu as never, "5.6", activate, true))
+    .rejects.toMatchObject({ code: "model_version_unavailable" });
+  expect(actions.slice(previousActions)).toEqual(["open-family-picker"]);
+});
+test("requested connector-free models and native reasoning fail closed without normalization", () => {
+  const captureFailure = (operation: () => unknown): unknown => {
+    try {
+      operation();
+    } catch (error) {
+      return error;
+    }
+    throw new Error("Expected a requested browser selection to fail closed");
+  };
+  expect(resolveRequestedChatGptMode("gpt-5.6-sol", undefined)).toEqual({
+    backendModelId: CHATGPT_WEB_MODEL_ID,
+    family: "5.6",
+    effort: "low",
+  });
+  expect(resolveRequestedChatGptMode("gpt-5.6-sol", "none")).toMatchObject({ effort: "low" });
+  expect(resolveRequestedChatGptMode("gpt-5.6-sol", "low")).toMatchObject({ effort: "low" });
+  expect(resolveRequestedChatGptMode("gpt-5.6-sol", "medium")).toMatchObject({ effort: "medium" });
+  expect(resolveRequestedChatGptMode("gpt-5.6-sol", "high")).toMatchObject({ effort: "high" });
+  expect(resolveRequestedChatGptMode("gpt-5.6-sol", "xhigh")).toMatchObject({ effort: "xhigh" });
+  for (const reasoning of ["minimal", "max"]) {
+    expect(captureFailure(() => resolveRequestedChatGptMode("gpt-5.6-sol", reasoning)))
+      .toMatchObject({ code: "reasoning_not_available", retryable: false });
+  }
+  expect(requestedModelUnavailable("gpt-5.6-luna"))
+    .toMatchObject({ status: 400, code: "model_not_available", retryable: false });
+  expect(requestedReasoningUnavailable("max")).toMatchObject({ status: 400, code: "reasoning_not_available", retryable: false });
+});
+
+test("requested unverified identities and unsupported Sol reasoning fail before prompt preparation or Send", async () => {
+  let prepared = 0;
+  let sends = 0;
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+    sendAttachedPrompt: async () => { sends += 1; },
+  }) as {
+    runBrowserTurn(turn: Record<string, unknown>): Promise<string>;
+    sendAttachedPrompt(): Promise<void>;
+  };
+  const request = (model: string, reasoning = "high") => worker.runBrowserTurn({
+    traceId: "deterministic-model-selection",
+    modelId: model,
+    requestedModel: model,
+    reasoning,
+    capabilities: {
+      localToolsEnabled: false,
+      solAvailable: true,
+      extraHighAvailable: true,
+      proAvailable: true,
+    },
+    prepare: async () => { prepared += 1; return {} as never; },
+  });
+  for (const model of [
+    "gpt-5.6-luna",
+    "gpt-5.6-terra",
+    "gpt-6-luna",
+    "gpt-6-sol",
+    "gpt-6-terra",
+    "gpt-6.1-luna",
+    "gpt-6.1-sol",
+    "gpt-6.1-terra",
+  ]) {
+    await expect(request(model)).rejects.toMatchObject({
+      code: "model_not_available",
+      retryable: false,
+    });
+  }
+  await expect(request("gpt-5.6-luna", "max")).rejects.toMatchObject({
+    code: "model_not_available",
+    retryable: false,
+  });
+  for (const reasoning of ["minimal", "max"]) {
+    await expect(request("gpt-5.6-sol", reasoning)).rejects.toMatchObject({
+      code: "reasoning_not_available",
+      retryable: false,
+    });
+  }
+  expect(prepared).toBe(0);
+  expect(sends).toBe(0);
+});
+
+test("the physical Send boundary rejects requested effort and model surface mutations before activation", async () => {
+  const state = { url: "https://chatgpt.com/?temporary-chat=true", label: "Instant" };
+  let sends = 0;
+  const sendButton = {
+    waitFor: async () => {},
+    isEnabled: async () => true,
+    press: async () => { sends += 1; },
+  };
+  const hidden = {
+    filter() { return this; },
+    last() { return this; },
+    getByRole() { return this; },
+    getByText() { return this; },
+    getByTestId() { return this; },
+    isVisible: async () => false,
+  };
+  const control = {
+    innerText: async () => state.label,
+    getAttribute: async () => "false",
+  };
+  const controls = {
+    filter() { return this; },
+    count: async () => 1,
+    first: () => control,
+  };
+  const composerForm = {
+    locator: (selector: string) => selector === CHATGPT_SEND_BUTTON_SELECTOR
+      ? sendButton
+      : selector === CHATGPT_EFFORT_CONTROL_SELECTOR
+        ? controls
+        : hidden,
+  };
+  const composer = {
+    locator: () => composerForm,
+    isEditable: async () => true,
+  };
+  const page = {
+    isClosed: () => false,
+    url: () => state.url,
+    locator: () => hidden,
+  } as unknown as Page;
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+    activeComposer: async () => composer,
+    waitForSubmissionAcceptedWithRecovery: async () => "user_turn",
+  }) as {
+    sendAttachedPrompt(...args: unknown[]): Promise<string>;
+    assertSelectedEffort(page: unknown, mode: unknown, verifyFamily?: boolean): Promise<void>;
+  };
+  const mode = {
+    modelId: CHATGPT_WEB_MODEL_ID,
+    effort: "low",
+    displayLabel: "Instant",
+    uiEffortIndex: 0,
+    thinkEnabled: false,
+    localTools: false,
+    requestedModel: "gpt-5.6-sol",
+    modelFamily: "5.6",
+    selection: { url: state.url, label: "Instant" },
+  };
+  const attempt = () => worker.sendAttachedPrompt(
+    page,
+    {} as never,
+    undefined,
+    undefined,
+    undefined,
+    {
+      onSendActivated: () => worker.assertSelectedEffort(page, mode, false),
+    },
+  );
+
+  await expect(attempt()).resolves.toBe("user_turn");
+  expect(sends).toBe(1);
+  state.label = "High";
+  await expect(attempt()).rejects.toMatchObject({ code: "reasoning_not_available", retryable: false });
+  expect(sends).toBe(1);
+  state.label = "Instant";
+  state.url = "https://chatgpt.com/c/mutated";
+  await expect(attempt()).rejects.toMatchObject({ code: "model_not_available", retryable: false });
+  expect(sends).toBe(1);
+});

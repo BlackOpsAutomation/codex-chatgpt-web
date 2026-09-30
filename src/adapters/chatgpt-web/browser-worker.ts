@@ -83,7 +83,16 @@ import {
   resolveChatGptWebTransportLimits,
 } from "../../chatgpt-web-models";
 import { LauncherBrowserHelperClient } from "./launcher-helper-client";
-import { assertChatGptModelFamily, selectChatGptModelFamily } from "./model-selection";
+import {
+  assertChatGptModelFamily,
+  assertRequestedEffortAvailable,
+  requestedModelUnavailable,
+  requestedReasoningUnavailable,
+  resolveRequestedChatGptMode,
+  selectChatGptModelFamily,
+  type ChatGptRequestedModel,
+  type RequestedChatGptMode,
+} from "./model-selection";
 import { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
 import {
   ChatGptCompactionHandoffAccepted,
@@ -880,6 +889,7 @@ export class ChatGptSubmissionRejectionObserver {
 
 type SelectedChatGptWebModelMode = ChatGptWebModelMode & {
   modelFamily?: "5.6" | "6";
+  requestedModel?: ChatGptRequestedModel;
   selection?: { url: string; label: string };
   usageModel?: ChatGptUsageModel;
 };
@@ -1262,6 +1272,7 @@ export interface BrowserTurn {
   modelId: string;
   reasoning?: string;
   modelFamily?: "5.6" | "6";
+  requestedModel?: ChatGptRequestedModel;
   capabilities: ChatGptWebCapabilities;
   prepare: () => Promise<CompiledChatGptWebPrompt & { release: () => void }>;
   prepareResume?: () => Promise<CompiledChatGptWebPrompt & { release: () => void }>;
@@ -2571,8 +2582,26 @@ export class ChatGptBrowserWorker {
     captureDiagnostic?: (checkpoint: string) => Promise<void>,
     trackUsage = false,
     modelFamily?: "5.6" | "6",
+    requestedModel?: ChatGptRequestedModel,
   ): Promise<SelectedChatGptWebModelMode> {
-    const mode = resolveChatGptWebModelMode(modelId, reasoning, capabilities);
+    let requestedMode: RequestedChatGptMode | undefined;
+    if (requestedModel) requestedMode = resolveRequestedChatGptMode(requestedModel, reasoning);
+    const effectiveModelFamily = requestedMode?.family ?? modelFamily;
+    const effectiveModelId = requestedMode?.backendModelId ?? modelId;
+    const effectiveCapabilities = requestedMode
+      ? { ...capabilities, solAvailable: requestedMode.backendModelId === CHATGPT_WEB_MODEL_ID, extraHighAvailable: true }
+      : capabilities;
+    const mode = resolveChatGptWebModelMode(
+      effectiveModelId,
+      requestedMode?.effort ?? reasoning,
+      effectiveCapabilities,
+    );
+    if (requestedMode && mode.uiEffortIndex === null) {
+      throw requestedModelUnavailable(requestedModel ?? "unknown");
+    }
+    if (requestedMode && mode.effort !== requestedMode.effort) {
+      throw requestedReasoningUnavailable(reasoning ?? "none");
+    }
     const composer = await this.activeComposer(page);
     const composerForm = composer.locator("xpath=ancestor::form[1]");
     const uiEffortIndex = mode.uiEffortIndex;
@@ -2615,8 +2644,11 @@ export class ChatGptBrowserWorker {
     await captureDiagnostic?.("effort-control-ready");
     await throwIfChatGptRateLimitDialog(page);
     let activation = await activateChatGptEffortMenu(page, currentEffort);
-    if (modelFamily) activation = await selectChatGptModelFamily(
-      activation, modelFamily, () => activateChatGptEffortMenu(page, currentEffort),
+    if (effectiveModelFamily) activation = await selectChatGptModelFamily(
+      activation,
+      effectiveModelFamily,
+      () => activateChatGptEffortMenu(page, currentEffort),
+      requestedModel !== undefined,
     );
     if (activation.method === "pointerdown") {
       await captureDiagnostic?.("effort-menu-pointerdown-fallback");
@@ -2650,6 +2682,7 @@ export class ChatGptBrowserWorker {
     const readAvailableEffort = async (container: Locator, menu: Locator) => {
       const state = await readChatGptEffortSnapshot(container)
         .catch(error => { throw chatGptModelControlUnavailableAdapterError(String(error)); });
+      if (requestedModel) assertRequestedEffortAvailable(state, uiEffortIndex, mode.effort);
       if (uiEffortIndex > state.max - state.min) {
         const detail = uiEffortIndex === 4 ? await chatGptUnavailableProDetail(menu) : undefined;
         throw chatGptModelControlUnavailableAdapterError(
@@ -2705,7 +2738,7 @@ export class ChatGptBrowserWorker {
     // closed label and reopen the menu once to prove the selection survived the commit.
     const selectedMode: SelectedChatGptWebModelMode = {
       ...mode,
-      ...(modelFamily ? { modelFamily } : {}),
+      ...(requestedMode ? { modelFamily: requestedMode.family, requestedModel } : modelFamily ? { modelFamily } : {}),
       selection: { url: selectionUrl, label: (await currentEffort.innerText()).trim() },
     };
     await this.assertSelectedEffort(page, selectedMode, false);
@@ -2715,7 +2748,7 @@ export class ChatGptBrowserWorker {
     if (confirmedState.min !== initialMin || confirmedState.value !== targetValue) {
       throw chatGptModelControlUnavailableAdapterError("ChatGPT did not persist the requested effort after closing its menu");
     }
-    if (modelFamily) await assertChatGptModelFamily(confirmation, modelFamily, mode.effort, uiEffortIndex, 1_000);
+    if (effectiveModelFamily) await assertChatGptModelFamily(confirmation, effectiveModelFamily, mode.effort, uiEffortIndex, 1_000);
     // A bare 'Pro' trigger does not identify the family selected by ChatGPT's Latest option.
     // Unknown evidence remains visible as unclassified Pro usage in Limits.
     if (trackUsage) {
@@ -2730,30 +2763,51 @@ export class ChatGptBrowserWorker {
   }
 
   private async assertSelectedEffort(page: Page, mode: SelectedChatGptWebModelMode, verifyFamily = true): Promise<void> {
-    if (!mode.selection) return;
+    if (!mode.selection) {
+      if (mode.requestedModel) throw requestedModelUnavailable(mode.requestedModel);
+      return;
+    }
     const composer = await this.activeComposer(page);
     const controls = composer.locator("xpath=ancestor::form[1]")
       .locator(CHATGPT_EFFORT_CONTROL_SELECTOR).filter({ visible: true });
     if (page.url() !== mode.selection.url || !mode.selection.label || await controls.count() !== 1) {
+      if (mode.requestedModel) throw requestedModelUnavailable(mode.requestedModel);
       throw chatGptModelControlUnavailableAdapterError("ChatGPT changed the selected model's browser surface before submission");
     }
     const control = controls.first();
     if ((await control.innerText()).trim() !== mode.selection.label
       || await control.getAttribute("aria-expanded") !== "false"
       || !await composer.isEditable()) {
+      if (mode.requestedModel) throw requestedReasoningUnavailable(mode.effort);
       throw chatGptModelControlUnavailableAdapterError(
         "ChatGPT did not retain the selected effort in its ready composer; the message was not submitted",
       );
     }
     if (verifyFamily && mode.modelFamily && mode.uiEffortIndex !== null) {
-      const menu = await activateChatGptEffortMenu(page, control);
       try {
-        await assertChatGptModelFamily(menu, mode.modelFamily, mode.effort, mode.uiEffortIndex);
-      } finally {
-        await page.keyboard.press("Escape");
+        const menu = await activateChatGptEffortMenu(page, control);
+        try {
+          await assertChatGptModelFamily(
+            menu, mode.modelFamily, mode.effort, mode.uiEffortIndex, 0, mode.requestedModel !== undefined,
+          );
+          if (mode.requestedModel) {
+            const liveEffort = await readChatGptEffortSnapshot(menu.sliderContainer)
+              .catch(error => { throw requestedReasoningUnavailable(mode.effort, error); });
+            assertRequestedEffortAvailable(liveEffort, mode.uiEffortIndex, mode.effort);
+          }
+        } finally {
+          await page.keyboard.press("Escape");
+        }
+      } catch (error) {
+        if (mode.requestedModel) {
+          if (error instanceof ChatGptWebAdapterError && error.code === "reasoning_not_available") throw error;
+          throw requestedModelUnavailable(mode.requestedModel, error);
+        }
+        throw error;
       }
       if (page.url() !== mode.selection.url || (await control.innerText()).trim() !== mode.selection.label
         || await control.getAttribute("aria-expanded") !== "false" || !await composer.isEditable()) {
+        if (mode.requestedModel) throw requestedModelUnavailable(mode.requestedModel);
         throw chatGptModelControlUnavailableAdapterError("ChatGPT changed the model while checking its family before submission");
       }
     }
@@ -4919,10 +4973,24 @@ export class ChatGptBrowserWorker {
     if (turn.captureLunaCheckpoint && turn.modelId !== CHATGPT_WEB_LUNA_MODEL_ID) {
       throw new Error("Private rolling checkpoint capture is valid only for ChatGPT Luna");
     }
-    const browserCapabilities = turn.nativeConnector
-      ? { ...turn.capabilities, localToolsEnabled: true }
-      : turn.capabilities;
-    const requestedMode = resolveChatGptWebModelMode(turn.modelId, turn.reasoning, browserCapabilities);
+    const requestedModelMode = turn.requestedModel
+      ? resolveRequestedChatGptMode(turn.requestedModel, turn.reasoning)
+      : undefined;
+    const browserCapabilities = turn.requestedModel
+      ? {
+        ...turn.capabilities,
+        ...(turn.nativeConnector ? { localToolsEnabled: true } : {}),
+        solAvailable: requestedModelMode?.backendModelId === CHATGPT_WEB_MODEL_ID,
+        extraHighAvailable: true,
+      }
+      : turn.nativeConnector
+        ? { ...turn.capabilities, localToolsEnabled: true }
+        : turn.capabilities;
+    const requestedMode = resolveChatGptWebModelMode(
+      requestedModelMode?.backendModelId ?? turn.modelId,
+      requestedModelMode?.effort ?? turn.reasoning,
+      browserCapabilities,
+    );
     const prepare = reuseConversation ? turn.prepareResume : turn.prepare;
     if (!prepare) throw new Error("The retained ChatGPT conversation has no continuation prompt");
     const prepared = await prepare();
@@ -4964,12 +5032,14 @@ export class ChatGptBrowserWorker {
         ? Math.max(...multipartStages.map(stage => stage.text.length))
         : undefined;
       const stagingMode = multipartStages
-        ? resolveChatGptWebMultipartStagingMode(
-          turn.modelId,
-          browserCapabilities,
-          maxStageMessageTokens!,
-          maxStageChars!,
-        )
+        ? turn.requestedModel
+          ? requestedMode
+          : resolveChatGptWebMultipartStagingMode(
+            turn.modelId,
+            browserCapabilities,
+            maxStageMessageTokens!,
+            maxStageChars!,
+          )
         : requestedMode;
       if (prepared.multipart) {
         assertChatGptWebMultipartInputWithinLimits(
@@ -5170,17 +5240,29 @@ export class ChatGptBrowserWorker {
       }
       // A retained lease proves the connector binding, not the current model selection.
       // Reconcile the live control before every submission, including retained continuations.
-      const selectStagingMode = () => (
-        this.selectModelAndEffort(
-          page,
-          turn.modelId,
-          stagingMode.effort,
-          browserCapabilities,
-          checkpoint => diagnostics.capture(page, checkpoint),
-          trackUsage,
-          turn.modelFamily,
-        )
-      );
+      const selectTurnMode = async (reasoning: string | undefined, checkpoint: string) => {
+        try {
+          return await this.selectModelAndEffort(
+            page,
+            turn.modelId,
+            reasoning,
+            browserCapabilities,
+            name => diagnostics.capture(page, `${checkpoint}-${name}`),
+            trackUsage,
+            turn.modelFamily,
+            turn.requestedModel,
+          );
+        } catch (error) {
+          if (!turn.requestedModel) throw error;
+          if (error instanceof ChatGptWebAdapterError) {
+            if (error.code === "model_not_available" || error.code === "reasoning_not_available") throw error;
+            if (error.code === "model_version_unavailable") throw requestedModelUnavailable(turn.requestedModel, error);
+            if (!["chatgpt_effort_locked", "upstream_server_error"].includes(error.code)) throw error;
+          }
+          throw requestedReasoningUnavailable(turn.reasoning ?? "none", error);
+        }
+      };
+      const selectStagingMode = () => selectTurnMode(stagingMode.effort, "staging");
       let mode = await this.runStage(turn.traceId, "effort_selection", browserStageTimeouts.effortSelection, selectStagingMode);
       await diagnostics.capture(page, "effort-selection-complete");
 
@@ -5317,15 +5399,7 @@ export class ChatGptBrowserWorker {
             turn.traceId,
             "final_part_effort_selection",
             browserStageTimeouts.effortSelection,
-            () => this.selectModelAndEffort(
-              page,
-              turn.modelId,
-              requestedMode.effort,
-              browserCapabilities,
-              checkpoint => diagnostics.capture(page, `final-part-${checkpoint}`),
-              trackUsage,
-              turn.modelFamily,
-            ),
+            () => selectTurnMode(requestedMode.effort, "final-part"),
           );
           await diagnostics.capture(page, "final-part-effort-selected");
         }
@@ -5378,15 +5452,7 @@ export class ChatGptBrowserWorker {
                 checkpoint => diagnostics.capture(page, checkpoint),
                 this.config.useSavedChats,
               );
-              mode = await this.selectModelAndEffort(
-                page,
-                turn.modelId,
-                turn.reasoning,
-                turn.capabilities,
-                checkpoint => diagnostics.capture(page, checkpoint),
-                trackUsage,
-                turn.modelFamily,
-              );
+              mode = await selectTurnMode(turn.requestedModel ? requestedMode.effort : turn.reasoning, "connector-refresh");
               submissionBaseline = await this.captureSubmissionBaseline(page, finalPrompt);
             },
           );

@@ -186,6 +186,37 @@ bun run app:package
 
 </details>
 
+## Explicit ChatGPT model selections
+
+The sibling `omp-chatgpt-web-bridge` can request an explicit ChatGPT model through
+this adapter's existing browser worker. The requested model and reasoning effort
+are independent; this path does not change ordinary Codex model registration or
+launch or own the authenticated browser profile.
+
+The registry names `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`,
+`gpt-6-luna`, `gpt-6-sol`, `gpt-6-terra`, `gpt-6.1-luna`, `gpt-6.1-sol`,
+and `gpt-6.1-terra`. Only `gpt-5.6-sol` has a verified exact normal ChatGPT
+selector contract. A configured ID is not evidence that ChatGPT exposes that
+model on a particular account. Luna is unavailable on this path until an exact,
+positive selected-model identity can be verified: the absence of a Sol
+selector and the presence or absence of Think do not identify a requested
+version or model family. Terra and the other Sol/Luna IDs likewise remain
+unavailable until their own exact selector contracts are verified.
+
+The connector-free provider does not require a Sol-capable account. Different
+authenticated ChatGPT accounts may expose different subsets of this catalogue.
+A Free account that exposes Luna can be supported once Luna's exact browser
+identity and selected-state contract is positively verified in that account;
+that verification is not required to configure `gpt-5.6-luna`.
+
+For GPT-5.6 Sol, native `none` and `low` resolve to Instant; `medium`, `high`,
+and `xhigh` retain their corresponding Sol controls. Before every physical
+Send, including retained continuation and multipart staging, the adapter
+re-verifies the exact selected model and effort. It does not fall back to
+another model or reasoning level. Unsupported, disabled, locked, or
+unverifiable selections fail without sending a message or claiming account
+availability.
+
 ## Star History
 
 <a href="https://www.star-history.com/?repos=miuuyy%2Fcodex-chatgpt-web&type=date&legend=top-left">

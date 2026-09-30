@@ -10,6 +10,7 @@ import { createBrowserHelperPromptSelection } from "./browser-helper-prompt-sele
 import { isChatGptWebMultipartPartCount, type CompiledChatGptWebPrompt } from "./prompt";
 import { ChatGptMirroredTurnProgress } from "./turn-progress";
 import type { ChatGptExternalTurnProgressSnapshot } from "./turn-progress";
+import type { ChatGptRequestedModel } from "./model-selection";
 
 interface RunMessage {
   type: "run";
@@ -27,6 +28,7 @@ interface RunMessage {
     modelId: string;
     reasoning?: string;
     modelFamily?: "5.6" | "6";
+    requestedModel?: ChatGptRequestedModel;
     capabilities: ChatGptWebCapabilities;
     nativeConnector?: boolean;
     resumeAvailable?: boolean;
@@ -221,6 +223,7 @@ async function run(message: RunMessage): Promise<void> {
     modelId: message.turn.modelId,
     reasoning: message.turn.reasoning,
     ...(message.turn.modelFamily ? { modelFamily: message.turn.modelFamily } : {}),
+    ...(message.turn.requestedModel ? { requestedModel: message.turn.requestedModel } : {}),
     capabilities: message.turn.capabilities,
     ...(message.turn.nativeConnector ? { nativeConnector: true } : {}),
     prepare: prepareSelected,
