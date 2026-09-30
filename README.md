@@ -213,9 +213,12 @@ For GPT-5.6 Sol, native `none` and `low` resolve to Instant; `medium`, `high`,
 and `xhigh` retain their corresponding Sol controls. Before every physical
 Send, including retained continuation and multipart staging, the adapter
 re-verifies the exact selected model and effort. It does not fall back to
-another model or reasoning level. Unsupported, disabled, locked, or
-unverifiable selections fail without sending a message or claiming account
-availability.
+another model or reasoning level. Unsupported, locked, or unverifiable
+selections fail without sending a message or claiming account availability.
+A disabled reasoning control is accepted only when it exposes exactly one
+unlocked position, that position is selected, and the request maps to it; exact
+model and effort identity are still verified. Disabled multi-position controls
+and requests for any other position fail closed.
 
 ## Star History
 

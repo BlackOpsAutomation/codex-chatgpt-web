@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chatGptModelFamilyMatches, selectChatGptModelFamily } from "../src/adapters/chatgpt-web/model-selection";
+import { assertRequestedEffortAvailable, chatGptModelFamilyMatches, resolveRequestedChatGptMode, selectChatGptModelFamily } from "../src/adapters/chatgpt-web/model-selection";
 
 test("model selection recognizes Latest in the launcher languages without accepting other model names", async () => {
   for (const [label, accepted] of [
@@ -31,4 +31,47 @@ test("family confirmation separates Latest staging from the actual Pro response"
   }
   expect(chatGptModelFamilyMatches(["6 Pro, 5 of 5."], "5.6", "max")).toBe(false);
   expect(chatGptModelFamilyMatches(["6 Pro, 5 of 5."], "6", "xhigh")).toBe(false);
+});
+
+const instantOnly = { min: 0, max: 0, value: 0, available: [true], disabled: true };
+
+test("disabled Instant-only state accepts its sole unlocked selected position", () => {
+  const requested = resolveRequestedChatGptMode("gpt-5.6-sol", "none");
+  assertRequestedEffortAvailable(instantOnly, 0, requested.effort);
+});
+
+for (const [effort, index] of [["medium", 1], ["high", 2], ["xhigh", 3], ["max", 4]] as const) {
+  test(`disabled Instant-only state rejects ${effort}`, () => {
+    expect(() => assertRequestedEffortAvailable(instantOnly, index, effort))
+      .toThrow(expect.objectContaining({ code: "reasoning_not_available", retryable: false }));
+  });
+}
+
+for (const [name, change] of [
+  ["locked", { available: [false] }],
+  ["missing tick", { available: [] }],
+  ["extra contradictory tick", { available: [true, true] }],
+  ["selection outside range", { value: 1 }],
+  ["disabled multi-position", { max: 1, available: [true, true] }],
+] satisfies Array<[string, Partial<typeof instantOnly>]>) {
+  test(`disabled control fails closed with ${name}`, () => {
+    expect(() => assertRequestedEffortAvailable({ ...instantOnly, ...change }, 0, "low"))
+      .toThrow(expect.objectContaining({ code: "reasoning_not_available", retryable: false }));
+  });
+}
+
+test("enabled multi-position availability preserves Medium High and Extra High locks", () => {
+  const state = { min: 0, max: 3, value: 0, available: [true, true, true, true], disabled: false };
+  for (const [effort, index] of [["medium", 1], ["high", 2], ["xhigh", 3]] as const) {
+    assertRequestedEffortAvailable(state, index, effort);
+    expect(() => assertRequestedEffortAvailable({ ...state, available: state.available.map((_, i) => i !== index) }, index, effort))
+      .toThrow(expect.objectContaining({ code: "reasoning_not_available" }));
+  }
+});
+
+test("reasoning indices outside the verified range fail closed", () => {
+  for (const index of [-1, 1, 0.5, NaN]) {
+    expect(() => assertRequestedEffortAvailable(instantOnly, index, "low"))
+      .toThrow(expect.objectContaining({ code: "reasoning_not_available" }));
+  }
 });

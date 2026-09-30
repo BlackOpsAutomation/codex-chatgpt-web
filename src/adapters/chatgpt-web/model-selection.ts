@@ -53,7 +53,13 @@ export function assertRequestedEffortAvailable(
   effortIndex: number,
   effort: string,
 ): void {
-  if (state.disabled || effortIndex > state.max - state.min || !state.available[effortIndex]) {
+  // A disabled single-position control cannot switch, but can still prove its selected effort.
+  // Exact model/effort identity is verified separately by assertChatGptModelFamily.
+  const soleSelectedPosition = state.min === state.max && state.value === state.min
+    && effortIndex === 0 && state.available.length === 1 && state.available[0] === true;
+  if ((state.disabled && !soleSelectedPosition)
+    || !Number.isInteger(effortIndex) || effortIndex < 0
+    || effortIndex > state.max - state.min || state.available[effortIndex] !== true) {
     throw requestedReasoningUnavailable(effort);
   }
 }

@@ -5,6 +5,7 @@ import {
   CHATGPT_EFFORT_CONTROL_SELECTOR,
   CHATGPT_EFFORT_MENU_SELECTOR,
   CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR,
+  CHATGPT_SEND_BUTTON_SELECTOR,
   activateChatGptEffortMenu,
   assertNewChatPage,
   chatGptNewChatUrl,
@@ -494,5 +495,74 @@ test("requested pre-Send checks reject a disabled tier or incorrect effort annou
     } else {
       await expect(assertion).resolves.toBeUndefined();
     }
+  }
+});
+
+test("Instant-only disabled picker reaches the verified pre-Send boundary; non-Instant requests do not", async () => {
+  for (const reasoning of ["none", "medium", "high", "xhigh", "max"]) {
+    const fixture = reasoningPicker({
+      max: "0", locks: ["false"], disabled: "true", closedInitially: true,
+      announcement: "Instant, 1 of 1.",
+    });
+    let presses = 0;
+    let verifiedBoundary = 0;
+    const stopBeforeSend = new Error("deterministic stop before physical Send");
+    const sendButton = {
+      waitFor: async () => {}, isEnabled: async () => true,
+      press: async () => { presses += 1; },
+    };
+    const composer = {
+      ...fixture.composer,
+      locator: () => ({
+        count: async () => 1,
+        locator: (selector: string) => selector === CHATGPT_SEND_BUTTON_SELECTOR ? sendButton : fixture.control,
+      }),
+    };
+    const hidden = {
+      filter() { return this; }, last() { return this; },
+      getByRole() { return this; }, getByText() { return this; }, getByTestId() { return this; },
+      isVisible: async () => false,
+      waitFor: ({ signal }: { signal: AbortSignal }) => {
+        const { promise, reject } = Promise.withResolvers<void>();
+        signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+        return promise;
+      },
+    };
+    const page = {
+      ...fixture.page,
+      isClosed: () => false,
+      locator: (selector: string) => [
+        CHATGPT_COMPOSER_SELECTOR, CHATGPT_EFFORT_MENU_SELECTOR, CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR,
+      ].includes(selector) ? fixture.page.locator(selector) : hidden,
+    };
+    // Exercise the real private worker methods with the suite's deterministic DOM fixture.
+    const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+      activeComposer: async () => composer,
+    }) as {
+      selectModelAndEffort(...args: unknown[]): Promise<unknown>;
+      assertSelectedEffort(page: unknown, mode: unknown): Promise<void>;
+      sendAttachedPrompt(...args: unknown[]): Promise<unknown>;
+    };
+    const attempt = async () => {
+      const mode = await worker.selectModelAndEffort(page, "gpt-5.6-sol", reasoning, {
+        localToolsEnabled: false, solAvailable: false, extraHighAvailable: false, proAvailable: false,
+      }, undefined, false, "5.6", "gpt-5.6-sol");
+      await worker.sendAttachedPrompt(page, {}, undefined, undefined, undefined, {
+        onSendActivated: async () => {
+          await worker.assertSelectedEffort(page, mode);
+          verifiedBoundary += 1;
+          throw stopBeforeSend;
+        },
+      });
+    };
+    if (reasoning === "none") {
+      await expect(attempt()).rejects.toBe(stopBeforeSend);
+      expect(verifiedBoundary).toBe(1);
+    } else {
+      await expect(attempt()).rejects.toMatchObject({ code: "reasoning_not_available", retryable: false });
+      expect(verifiedBoundary).toBe(0);
+    }
+    expect(presses).toBe(0);
+    expect(fixture.keys).toEqual([]);
   }
 });
