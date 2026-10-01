@@ -195,13 +195,30 @@ export async function readChatGptEffortSnapshot(
         || Boolean(owner?.hasAttribute("disabled"));
       const power = container.hasAttribute("data-model-picker-power-slider")
         && owner?.getAttribute("aria-disabled") === "false";
+      const ticks = Array.from(container.querySelectorAll("[data-selected]"));
+      const keyboardOwner = container.closest('[role="menuitem"][data-reasoning-slider="true"]');
+      const descriptionIds = (keyboardOwner?.getAttribute("aria-describedby") ?? "").split(/\s+/).filter(Boolean);
+      const announcement = descriptionIds.length > 0
+        ? container.ownerDocument.getElementById(descriptionIds[0]!)?.textContent?.trim() : undefined;
+      // The disabled singleton power picker leaves Radix's thumb at its default 0..1
+      // range. Its owning accessibility announcement and selected tick prove 0..0.
+      // Do not infer availability from a disabled multi-position or locked control.
+      const singletonPower = container.hasAttribute("data-model-picker-power-slider")
+        && owner?.getAttribute("aria-disabled") === "true"
+        && keyboardOwner?.getAttribute("aria-disabled") === "true"
+        && sliders.length === 1
+        && slider?.getAttribute("aria-valuemin") === "0"
+        && slider?.getAttribute("aria-valuemax") === "1"
+        && slider?.getAttribute("aria-valuenow") === "0"
+        && announcement === "Instant, 1 of 1."
+        && ticks.length === 1 && ticks[0]?.getAttribute("data-selected") === "true"
+        && ticks[0]?.getAttribute("data-locked") === null;
       return {
         min: slider?.getAttribute("aria-valuemin") ?? null,
-        max: slider?.getAttribute("aria-valuemax") ?? null,
+        max: singletonPower ? "0" : slider?.getAttribute("aria-valuemax") ?? null,
         value: slider?.getAttribute("aria-valuenow") ?? null,
         disabled,
-        locks: Array.from(container.querySelectorAll("[data-selected]"), tick =>
-          tick.getAttribute("data-locked") ?? (power ? "false" : null)),
+        locks: ticks.map(tick => tick.getAttribute("data-locked") ?? (power || singletonPower ? "false" : null)),
       };
     });
     const state = parseChatGptEffortSliderState(snapshot.min, snapshot.max, snapshot.value);

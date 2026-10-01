@@ -1,4 +1,4 @@
-import { activateChatGptEffortMenu, parseChatGptEffortSliderState } from "../../chatgpt-session";
+import { activateChatGptEffortMenu, readChatGptEffortSnapshot } from "../../chatgpt-session";
 import { CHATGPT_WEB_LUNA_MODEL_ID, CHATGPT_WEB_MODEL_ID } from "./model";
 import type { ChatGptWebAdapterEffort, ChatGptWebModelFamily } from "../../chatgpt-web-models";
 import type { ChatGptEffortSliderState } from "../../chatgpt-session";
@@ -231,10 +231,7 @@ export async function assertChatGptModelFamily(
   do {
     const option = familyOption(menu, family, requireExactEffort);
     const checked = await option.count() === 1 && await option.getAttribute("aria-checked") === "true";
-    const state = parseChatGptEffortSliderState(
-      await menu.slider.getAttribute("aria-valuemin"), await menu.slider.getAttribute("aria-valuemax"),
-      await menu.slider.getAttribute("aria-valuenow"),
-    );
+    const state = await readChatGptEffortSnapshot(menu.sliderContainer).catch(() => undefined);
     const descriptions = await menu.slider.locator("xpath=ancestor::*[@role='menuitem'][1]").evaluate(element => (
       (element.getAttribute("aria-describedby") ?? "").split(/\s+/).filter(Boolean)
         .map(id => element.ownerDocument.getElementById(id)?.textContent ?? "")

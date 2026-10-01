@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import type { Locator } from "playwright-core";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
 import {
   CHATGPT_COMPOSER_SELECTOR,
@@ -10,6 +11,7 @@ import {
   assertNewChatPage,
   chatGptNewChatUrl,
   detectChatGptAccountCapabilities,
+  readChatGptEffortSnapshot,
 } from "../src/chatgpt-session";
 
 test("saved chats start empty and cannot reuse an arbitrary conversation or a Temporary Chat", async () => {
@@ -427,6 +429,31 @@ test("power picker omission of lock attributes requires its enabled structural o
     { power: true, max: "3" },
   ]) await expect(detectChatGptAccountCapabilities(reasoningPicker({ ...options, locks: Array(5).fill(null) }).page as never))
     .rejects.toThrow("availability");
+});
+
+test("disabled singleton power picker uses its owned Instant announcement, not the default thumb range", async () => {
+  const { createDocument } = require("@mixmark-io/domino") as { createDocument(html: string): Document };
+  const snapshot = async (options: {
+    announcement?: string; selected?: string; lock?: string; max?: string; value?: string; ownerDisabled?: string;
+  } = {}) => {
+    const document = createDocument(`<div role="menuitem" data-reasoning-slider="true"
+      aria-disabled="${options.ownerDisabled ?? "true"}" aria-describedby="selection">
+      <span id="selection">${options.announcement ?? "Instant, 1 of 1."}</span>
+      <div data-model-picker-power-slider><span data-orientation="horizontal" aria-disabled="true">
+        <span data-selected="${options.selected ?? "true"}"${options.lock === undefined ? "" : ` data-locked="${options.lock}"`}></span>
+        <span role="slider" aria-valuemin="0" aria-valuemax="${options.max ?? "1"}" aria-valuenow="${options.value ?? "0"}"></span>
+      </span></div></div>`);
+    // DOM-backed evaluate stand-in: this reader only invokes Locator.evaluate.
+    const container = {
+      evaluate: async <T>(read: (element: Element) => T) => read(document.querySelector("[data-model-picker-power-slider]")!),
+    } as unknown as Locator;
+    return readChatGptEffortSnapshot(container, 0);
+  };
+  await expect(snapshot()).resolves.toEqual({ min: 0, max: 0, value: 0, available: [true], disabled: true });
+  for (const options of [
+    { announcement: "Medium, 1 of 1." }, { announcement: "Instant, 1 of 2." },
+    { selected: "false" }, { lock: "true" }, { max: "4" }, { value: "1" }, { ownerDisabled: "false" },
+  ]) await expect(snapshot(options)).rejects.toThrow("availability");
 });
 
 test("stale saved capabilities cannot activate a locked effort; High remains selectable", async () => {

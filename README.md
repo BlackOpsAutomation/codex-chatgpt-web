@@ -116,7 +116,19 @@ that option clicks **Allow once**, never a permanent grant.
 Use **Activity** for safe local diagnostics and **Settings → Run doctor** for end-to-end health.
 Settings can also cancel a retained browser turn or remove the Codex integration before uninstall.
 **Save chats in ChatGPT** keeps task conversations in ChatGPT history. Off by default; independent of **New browser chat for each turn**.
-Set `CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS=1` only when every browser checkpoint needs a screenshot.
+Set `CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS=1` only when ordinary browser checkpoints need screenshots.
+Prompt-fidelity failures also write a `prompt-attachment-integrity-mismatch` JSON checkpoint before
+clearing the composer. It records raw/equivalence-aware prefixes, suffix realignment, differing
+UTF-16 units/code points, escaped local context, line offsets, and bounded composer-node structure.
+Each context covers up to 32 UTF-16 units before and after a mismatch; if raw and equivalence-aware
+mismatches differ, both windows are retained, capped at 128 source units per expected/actual side.
+These failure-only artifacts contain no complete prompt, composer HTML, screenshot, or general
+page state. The bounded excerpts may still contain task text: treat them as private diagnostics.
+Capture is best effort; failure still rejects the turn before Send and clears the draft.
+Prompt verification permits ASCII space → NBSP only within repeated ASCII-space runs or immediately
+after an expected newline, where native contenteditable insertion preserves paragraph indentation.
+Single interior spaces, tabs, newline changes, intentional expected NBSP, length changes, and text
+mutations remain exact and fail closed; insertion and DOM extraction are unchanged.
 
 New installs use **Compatibility V1** for cross-backend subagents. **Native** preserves Codex's own
 feature settings and enables plaintext Web-to-Web V2 delegation. Restart Codex and start a new task
@@ -219,6 +231,100 @@ A disabled reasoning control is accepted only when it exposes exactly one
 unlocked position, that position is selected, and the request maps to it; exact
 model and effort identity are still verified. Disabled multi-position controls
 and requests for any other position fail closed.
+The singleton power picker can expose `Instant, 1 of 1.` on its disabled keyboard
+owner while the underlying Radix thumb retains its default `0..1` range.
+Only that exact owned announcement, one selected tick without a lock marker,
+and the observed disabled control structure are recognized as the single Instant
+position. Other ambiguous or locked controls still fail closed; the checked
+GPT-5.6 Sol row and exact effort announcement must independently match before Send.
+
+
+### Browser-backed OMP launch
+
+Use `omp-chatgpt-web` for sessions using the `ebay-chatgpt-web/*` provider.
+The project-owned launcher in `bin/omp-chatgpt-web` selects the existing
+`~/.omp/agent/config.ebay-instant.yml` overlay through `PI_CONFIG_FILES` and
+passes OMP's native `--no-title` flag as the primary automatic-title suppression
+mechanism. It also exports `PI_NO_TITLE=1` only to that OMP process and its
+children as defense in depth. Idle recap remains disabled through the browser
+overlay, which must include:
+
+```yaml
+recap:
+  enabled: false
+memory:
+  backend: off
+```
+
+Automatic titles, idle recaps, and local-memory startup are disabled for browser
+sessions. Titles can race foreground work; idle recaps use the active session
+model rather than the memory role; local-memory startup can launch concurrent
+rollout summarization requests using the browser-backed memory role and the
+foreground session's request identity. The bridge
+remains single-task; these controls prevent those auxiliary requests from
+competing for its browser lease. They do not disable tools, subagents, or
+explicit user-requested work, and they do not add concurrent browser tasks.
+
+The launcher also loads the sibling checkout's production provider extension,
+`../omp-chatgpt-web-bridge/omp/ebay-chatgpt-web.ts`, resolving its path relative
+to the real launcher rather than the task directory. Both checkouts are required.
+This reuses the existing provider catalogue and `openai-responses` contract at
+`http://127.0.0.1:17844/v1`, including `reasoningDisableMode: "none-effort"`.
+Without that registration, a catalogue-only provider can serialize OMP `off`
+as a reasoning tier instead of Instant. The overlay selects
+`ebay-chatgpt-web/gpt-5.6-sol:off`. A configured model or effort remains subject
+to the authenticated account's availability.
+
+If `~/.omp/agent/models.yml` already declares this provider, its `gpt-5.6-sol`
+model must also declare `compat.reasoningDisableMode: none-effort`. Interactive
+catalogue hydration can otherwise replace the extension's wire compatibility
+and serialize `off` as `low`, including between tool rounds. Keep this override
+model-scoped; do not change sibling models or unrelated provider credentials.
+Verify the native interactive request payload, not only a text-mode probe.
+
+Attached-Chrome new-chat navigation waits for document commit, then verifies the
+visible composer, authenticated surface, and requested new-chat URL. Deferred
+resources need not finish before those checks; model/effort and prompt-integrity
+checks still run before Send. Managed-Chrome and launcher navigation retain
+their existing readiness behavior.
+
+Retained conversations verify the owned page, document marker, exact route, and
+previous trusted user-turn anchor before each continuation. After the response,
+one DOM snapshot must verify that previous anchor and select the newest mounted
+user turn. Page, marker and route are rechecked before accepting the continuation.
+This identity chain tolerates virtualized older turns but fails closed if the
+previous anchor disappears, the route changes, or the document is replaced.
+
+On this host, `~/.local/bin/omp-chatgpt-web` links to the project launcher.
+To install the command from another checkout, with OMP already on `PATH`:
+
+```bash
+ln -s "$PWD/bin/omp-chatgpt-web" "$HOME/.local/bin/omp-chatgpt-web"
+```
+
+Start a fresh session from the task directory:
+
+```bash
+cd /path/to/task
+omp-chatgpt-web
+```
+
+The launcher forwards OMP arguments and preserves existing environment overlays,
+appending the browser overlay. Later explicit `--config` overrides or in-session
+setting changes can supersede it; do not re-enable recap or a memory backend for
+browser-backed sessions. Use ordinary `omp` and the normal overlays for unrelated
+API-backed sessions; their title, recap and memory behavior remains unchanged.
+
+Check the effective setting without sending an inference request:
+
+```bash
+omp-chatgpt-web config get recap.enabled --json
+omp-chatgpt-web config get memory.backend --json
+```
+
+These must report `false` and `"off"` respectively. No bridge, Chrome, or Xvfb restart is needed.
+Validate a fresh launch's effective provider/reasoning and foreground workload;
+a configuration probe alone does not establish live dashboard acceptance.
 
 ## Star History
 

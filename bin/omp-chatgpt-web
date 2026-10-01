@@ -1,0 +1,23 @@
+#!/bin/sh
+# Use the existing browser overlay without changing ordinary OMP launches.
+set -eu
+
+browser_config="$HOME/.omp/agent/config.ebay-instant.yml"
+if [ ! -r "$browser_config" ]; then
+    printf 'Missing browser-backed OMP config: %s\n' "$browser_config" >&2
+    exit 1
+fi
+
+# Load the production provider contract, including exact off -> none serialization.
+# Resolve the installed symlink so launching from a task directory is independent of cwd.
+launcher_path="$(readlink -f "$0")"
+provider_extension="$(dirname "$(dirname "$launcher_path")")/../omp-chatgpt-web-bridge/omp/ebay-chatgpt-web.ts"
+if [ ! -r "$provider_extension" ]; then
+    printf 'Missing browser-backed OMP provider: %s\n' "$provider_extension" >&2
+    exit 1
+fi
+
+# Auxiliary inference must not compete for the single-task browser lease.
+export PI_NO_TITLE=1
+export PI_CONFIG_FILES="${PI_CONFIG_FILES:+$PI_CONFIG_FILES:}$browser_config"
+exec omp --no-title --extension "$provider_extension" "$@"

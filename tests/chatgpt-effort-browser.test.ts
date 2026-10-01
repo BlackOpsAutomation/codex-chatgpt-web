@@ -1,8 +1,41 @@
 import { expect, test } from "bun:test";
-import { chromium, type Locator } from "playwright-core";
+import { chromium, type Locator, type Page } from "playwright-core";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
 import { detectChatGptAccountCapabilities } from "../src/chatgpt-session";
 import { assertChatGptModelFamily } from "../src/adapters/chatgpt-web/model-selection";
+
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("attached navigation verifies the composer without waiting for deferred resources", async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+  let releaseResource: () => void = () => {};
+  const resourceGate = new Promise<void>(resolve => { releaseResource = resolve; });
+  try {
+    const page = await browser.newPage();
+    await page.route("https://chatgpt.com/**", async route => {
+      if (new URL(route.request().url()).pathname === "/deferred.js") {
+        await resourceGate;
+        await route.fulfill({ contentType: "text/javascript", body: "" });
+      } else {
+        await route.fulfill({ contentType: "text/html", body: `<html><head>
+          <script>document.addEventListener("DOMContentLoaded", () => document.body.dataset.loaded = "true");</script>
+          <script defer src="/deferred.js"></script></head><body>
+          <form><div id="prompt-textarea" contenteditable="true"></div></form></body></html>` });
+      }
+    });
+    const worker = ChatGptBrowserWorker.forProvider({
+      adapter: "chatgpt-web", baseUrl: "https://chatgpt.com",
+      chatgptWeb: { browserHost: "attached-chrome", browserAttachEndpoint: "http://127.0.0.1:39222" },
+    });
+    const surfaceWorker = worker as unknown as { prepareChatSurface(page: Page): Promise<Locator> };
+    const composer = await surfaceWorker.prepareChatSurface(page);
+    expect(await composer.isEditable()).toBe(true);
+    expect(page.url()).toBe("https://chatgpt.com/?temporary-chat=true");
+    expect(await page.locator("body").getAttribute("data-loaded")).toBeNull();
+    expect(await composer.innerText()).toBe("");
+  } finally {
+    releaseResource();
+    await browser.close();
+  }
+}, 20_000);
 
 test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("family gate accepts the checked Sol row with a versionless power announcement, but never ambiguous evidence", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
@@ -38,10 +71,16 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("family gate accepts the chec
         <span id="help">Use Left and Right arrow keys to adjust power.</span>
         ${"extra" in scenario ? `<span id="extra">${scenario.extra}</span>` : ""}
         <div role="menuitem" aria-describedby="announcement help ${"extra" in scenario ? "extra" : ""}">
-          <div data-model-picker-power-slider><span role="slider" aria-hidden="true"
-            aria-valuemin="0" aria-valuemax="${scenario.max}" aria-valuenow="${scenario.index}"></span></div>
+          <div data-model-picker-power-slider><span data-orientation="horizontal" aria-disabled="false">
+            ${Array(scenario.max + 1).fill('<span data-selected="true"></span>').join("")}
+            <span role="slider" aria-hidden="true"
+              aria-valuemin="0" aria-valuemax="${scenario.max}" aria-valuenow="${scenario.index}"></span>
+          </span></div>
         </div>`);
-      const menu = { menu: page.locator("#picker"), slider: page.locator('[role="slider"]') } as unknown as Parameters<typeof assertChatGptModelFamily>[0];
+      const menu = {
+        menu: page.locator("#picker"), slider: page.locator('[role="slider"]'),
+        sliderContainer: page.locator("[data-model-picker-power-slider]"),
+      } as unknown as Parameters<typeof assertChatGptModelFamily>[0];
       try {
         await (scenario.valid
           ? expect(assertChatGptModelFamily(menu, scenario.family, scenario.effort, scenario.index)).resolves.toBeUndefined()

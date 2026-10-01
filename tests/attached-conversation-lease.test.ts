@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
+import { chromium } from "playwright-core";
 import {
   ATTACHED_LEASE_MARKER_PROPERTY,
   attachedConversationLeaseRequested,
@@ -49,9 +50,9 @@ function leasePage() {
       }
       if (arg && typeof arg === "object" && "userTurnSelector" in arg) {
         const expected = "expected" in arg && typeof arg.expected === "string" ? arg.expected : undefined;
-        if (new Set(anchors).size !== anchors.length) return undefined;
-        return expected ? anchors.filter(value => value === expected).length === 1 ? expected : undefined
-          : anchors[0];
+        if (new Set(anchors).size !== anchors.length
+          || (expected && anchors.filter(value => value === expected).length !== 1)) return undefined;
+        return expected && !("advance" in arg && arg.advance === true) ? expected : anchors.at(-1);
       }
       if (typeof arg === "string") return store.get(arg);
       return fn(arg);
@@ -151,6 +152,46 @@ test("owned attached page is reused and a lost marker does not open another page
   expect(harness.created()).toBe(1);
   expect(harness.page.closes()).toBe(1);
 });
+
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("retained conversation advances its trusted anchor through a five-turn DOM window", async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.setContent("<main></main>");
+    const harness = workerFor("attached-chrome");
+    harness.page.evaluate = (fn, arg) => page.evaluate(fn, arg);
+    let round = 0;
+    harness.worker.runBrowserTurn = async () => {
+      await page.evaluate(index => {
+        const group = document.createElement("div");
+        group.setAttribute("data-turn-key", `window-${index}`);
+        const user = document.createElement("div");
+        user.setAttribute("data-user-message-bubble", "");
+        group.append(user);
+        document.querySelector("main")!.append(group);
+        const groups = document.querySelectorAll("[data-turn-key]");
+        if (groups.length > 5) groups[0]!.remove();
+      }, ++round);
+      return `response-${round}`;
+    };
+    expect(await harness.worker.run(turn())).toBe("response-1");
+    for (let next = 2; next <= 9; next++) {
+      expect(await harness.worker.run(turn({ requireRetainedConversation: true }))).toBe(`response-${next}`);
+    }
+    expect(await page.locator('[data-turn-key="window-1"]').count()).toBe(0);
+    expect(harness.created()).toBe(1);
+    expect(harness.page.closes()).toBe(0);
+    // The marker and URL alone must not authorize a replacement conversation.
+    harness.worker.runBrowserTurn = async () => {
+      ++round;
+      await page.locator("main").evaluate(element => { element.innerHTML = '<div data-turn-key="untrusted"><div data-user-message-bubble></div></div>'; });
+      return "untrusted-response";
+    };
+    await expect(harness.worker.run(turn({ requireRetainedConversation: true }))).rejects.toThrow("no longer available");
+    expect(round).toBe(10);
+    expect(harness.page.closes()).toBe(1);
+  } finally { await browser.close(); }
+}, 30_000);
 
 test("release and worker close close only the owned page and do not kill Chrome", async () => {
   const harness = workerFor("attached-chrome");

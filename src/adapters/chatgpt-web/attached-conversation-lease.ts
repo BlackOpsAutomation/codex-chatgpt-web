@@ -24,16 +24,17 @@ export function attachedConversationIdentity(url: string): string | undefined {
   }
 }
 
-/** An existing user turn's outer identity survives response virtualization. */
+/** Select the newest mounted user identity, or verify an exact previously trusted anchor. */
 export async function readAttachedConversationAnchor(
   page: AttachedLeasePage,
   userTurnSelector: string,
   expected?: string,
+  advance = false,
 ): Promise<string | undefined> {
   if (page.isClosed()) return undefined;
   try {
     return await page.evaluate((input: unknown) => {
-      const { userTurnSelector, expected } = input as { userTurnSelector: string; expected?: string };
+      const { userTurnSelector, expected, advance } = input as { userTurnSelector: string; expected?: string; advance: boolean };
       const groups = [...document.querySelectorAll("[data-turn-key]")];
       const containers = [...document.querySelectorAll("[data-turn-id-container]")].filter(element =>
         !element.closest("[data-turn-key]")
@@ -44,15 +45,18 @@ export async function readAttachedConversationAnchor(
         ...containers.map(element => `turn:${element.getAttribute("data-turn-id-container") ?? ""}`),
       ];
       if (outer.some(anchor => anchor.endsWith(":")) || new Set(outer).size !== outer.length) return undefined;
-      if (expected) return outer.filter(anchor => anchor === expected).length === 1 ? expected : undefined;
+      if (expected) {
+        if (outer.filter(anchor => anchor === expected).length !== 1) return undefined;
+        if (!advance) return expected;
+      }
 
-      const group = groups.find(element => element.querySelector("[data-user-message-bubble]"));
+      const group = groups.findLast(element => element.querySelector("[data-user-message-bubble]"));
       if (group) return `group:${group.getAttribute("data-turn-key")}`;
       const users = [...document.querySelectorAll(userTurnSelector)];
       const userIdentities = new Set(users.map(element => element.getAttribute("data-turn-id")));
-      const container = containers.find(element => userIdentities.has(element.getAttribute("data-turn-id-container")));
+      const container = containers.findLast(element => userIdentities.has(element.getAttribute("data-turn-id-container")));
       return container ? `turn:${container.getAttribute("data-turn-id-container")}` : undefined;
-    }, { userTurnSelector, expected });
+    }, { userTurnSelector, expected, advance });
   } catch {
     return undefined;
   }

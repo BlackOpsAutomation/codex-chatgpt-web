@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { skillFileTokens, validateSkillFiles } from "./skill-attachments";
 import { detectChatGptLimitsPlan, readChatGptUsageAccount, readChatGptUsageModel, supportsChatGptUsageTracking, type ChatGptUsageModel } from "./limits";
 import { chromium, type Browser, type BrowserContext, type Locator, type Page, type Request, type Response } from "playwright-core";
+import { describePromptMismatch, snapshotPromptMismatchDom, type PromptDiagnosticCapture, type PromptMismatchDiagnostic } from "./prompt-mismatch-diagnostics";
 import {
   assertLoopbackBrowserAttachEndpoint,
   atomicWriteFile,
@@ -1871,7 +1872,7 @@ class ChatGptBrowserDiagnostics {
     this.directory = join(this.root, `${traceId}-${randomUUID().slice(0, 8)}`);
   }
 
-  async capture(page: Page, checkpoint: string, error?: unknown): Promise<void> {
+  async capture(page: Page, checkpoint: string, error?: unknown, mismatch?: PromptMismatchDiagnostic): Promise<void> {
     try {
       if (!this.initialized) {
         privateDirectory(this.root);
@@ -1881,6 +1882,15 @@ class ChatGptBrowserDiagnostics {
       }
       const sequence = String(++this.sequence).padStart(2, "0");
       const stem = `${sequence}-${browserDiagnosticCheckpoint(checkpoint)}`;
+      if (mismatch) {
+        // No screenshot or general page state: this checkpoint may retain only bounded composer evidence.
+        atomicWriteFile(join(this.directory, `${stem}.json`), `${JSON.stringify({
+          version: 2, capturedAt: new Date().toISOString(), traceId: this.traceId, checkpoint,
+          promptMismatch: mismatch,
+        }, null, 2)}\n`);
+        console.info(`[chatgpt-web] browser diagnostic trace=${this.traceId} checkpoint=${stem} path=${this.directory}`);
+        return;
+      }
       const includeScreenshot = process.env.CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS === "1";
       const [screenshotResult, stateResult] = await Promise.allSettled([
         includeScreenshot
@@ -2088,7 +2098,7 @@ class ChatGptBrowserDiagnostics {
       console.warn(
         `[chatgpt-web] browser diagnostic capture failed trace=${this.traceId}`
         + ` checkpoint=${browserDiagnosticCheckpoint(checkpoint)}:`
-        + ` ${captureError instanceof Error ? captureError.message : String(captureError)}`,
+        + ` ${mismatch ? "bounded mismatch capture unavailable" : captureError instanceof Error ? captureError.message : String(captureError)}`,
       );
     }
   }
@@ -2279,10 +2289,10 @@ export class ChatGptBrowserWorker {
   private constructor(private readonly config: ResolvedBrowserConfig) {}
 
   /**
-   * Lexical/contenteditable may preserve runs of ASCII spaces by exposing some of them as NBSP
-   * through DOM textContent. Treat that DOM-only representation as equivalent only when the
-   * expected U+0020 belongs to a multi-space run. Single spaces, tabs, newlines, intentional
-   * expected NBSP characters, and every other mutation remain exact and fail closed.
+   * Contenteditable insertion preserves collapsible ASCII spaces as NBSP in DOM textContent.
+   * Accept that directional representation only within a multi-space run or immediately after
+   * an expected newline (the paragraph-leading space observed in the dashboard failure).
+   * Interior single spaces, tabs, newlines, intentional NBSP, and every other mutation stay exact.
    */
   private promptCodeUnitEquivalent(
     expected: string,
@@ -2295,7 +2305,7 @@ export class ChatGptBrowserWorker {
     if (expectedUnit === observedUnit) return true;
     if (expectedUnit !== " " || observedUnit !== "\u00A0") return false;
 
-    return expected[index - 1] === " " || expected[index + 1] === " ";
+    return expected[index - 1] === " " || expected[index + 1] === " " || expected[index - 1] === "\n";
   }
 
   private promptTextEquivalent(
@@ -2860,7 +2870,9 @@ export class ChatGptBrowserWorker {
     const targetUrl = chatGptNewChatUrl(useSavedChats);
     if (page.url() !== targetUrl) {
       await page.goto(targetUrl, {
-        waitUntil: "domcontentloaded",
+        // Attached pages can expose the authenticated composer while deferred resources
+        // still block DOMContentLoaded. The surface checks below, not that event, gate Send.
+        waitUntil: this.config?.browserHost === "attached-chrome" ? "commit" : "domcontentloaded",
         timeout: 60_000,
       });
       await captureDiagnostic?.(useSavedChats ? "saved-chat-navigation-complete" : "temporary-chat-navigation-complete");
@@ -3340,6 +3352,7 @@ export class ChatGptBrowserWorker {
     page: Page,
     prompt: string,
     abortSignal?: AbortSignal,
+    captureDiagnostic?: PromptDiagnosticCapture,
   ): Promise<void> {
     const deadline = Date.now() + 10_000;
     let observed = "";
@@ -3355,6 +3368,22 @@ export class ChatGptBrowserWorker {
     }
     throwIfPromptAttachmentAborted(abortSignal);
     const commonPrefix = this.promptEquivalentPrefixLength(prompt, observed);
+    if (captureDiagnostic) {
+      const mismatch = describePromptMismatch(prompt, observed, commonPrefix);
+      try {
+        const composer = await this.activeComposer(page, 1_000, abortSignal);
+        const snapshot = await composer.evaluate(snapshotPromptMismatchDom, commonPrefix, {
+          timeout: 1_000, signal: abortSignal,
+        });
+        mismatch.dom = { ...snapshot.structure, matchesLastReadback: snapshot.text === observed };
+      } catch {
+        mismatch.domCaptureFailed = true;
+      }
+      // Diagnostic failure must never replace the integrity error or prevent draft cleanup.
+      try {
+        await captureDiagnostic("prompt-attachment-integrity-mismatch", mismatch);
+      } catch { /* Best-effort evidence; the original fail-closed error remains authoritative. */ }
+    }
     throw new ChatGptPromptAttachmentIntegrityError(
       `ChatGPT composer did not preserve the complete prompt (expectedChars=${prompt.length}, actualChars=${observed.length}, commonPrefixChars=${commonPrefix})`,
     );
@@ -3681,7 +3710,7 @@ export class ChatGptBrowserWorker {
     page: Page,
     prompt: string,
     localTools: boolean,
-    captureDiagnostic?: (checkpoint: string) => Promise<void>,
+    captureDiagnostic?: PromptDiagnosticCapture,
     abortSignal?: AbortSignal,
     catalogRefreshAvailable = false,
     connectorAttemptBudget?: ChatGptConnectorAttemptBudget,
@@ -3706,7 +3735,7 @@ export class ChatGptBrowserWorker {
           await setChatGptThinkMode(composer.locator("xpath=ancestor::form[1]"), true, captureDiagnostic, abortSignal);
         }
         await this.insertPromptText(page, prompt, abortSignal);
-        await this.assertPromptAttached(page, prompt, abortSignal);
+        await this.assertPromptAttached(page, prompt, abortSignal, captureDiagnostic);
         return;
       }
       const selectedComposer = await this.selectConnector(
@@ -3728,7 +3757,7 @@ export class ChatGptBrowserWorker {
         timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS,
       });
       await this.insertPromptText(page, ` ${prompt}`, abortSignal);
-      await this.assertPromptAttached(page, prompt, abortSignal);
+      await this.assertPromptAttached(page, prompt, abortSignal, captureDiagnostic);
     } catch (error) {
       if (!composerMutationStarted || error instanceof ChatGptPersistentBrowserStateError) throw error;
       try {
@@ -3988,7 +4017,7 @@ export class ChatGptBrowserWorker {
     localTools: boolean,
     compaction: boolean,
     baseline: ChatGptSubmissionBaseline,
-    captureDiagnostic?: (checkpoint: string) => Promise<void>,
+    captureDiagnostic?: PromptDiagnosticCapture,
     abortSignal?: AbortSignal,
     catalogRefreshAvailable = false,
     connectorAttemptBudget?: ChatGptConnectorAttemptBudget,
@@ -4822,6 +4851,11 @@ export class ChatGptBrowserWorker {
       );
       if (lease.cancelled || page.isClosed()) throw chatGptRetainedConversationUnavailableError();
       if (turn.requireRetainedConversation) {
+        // Verify the previous anchor and select its successor in one DOM snapshot.
+        // Older turns can leave the window without invalidating this identity chain.
+        const anchor = await readAttachedConversationAnchor(page, CHATGPT_USER_TURN_SELECTOR, lease.anchor, true);
+        if (!anchor) throw chatGptRetainedConversationUnavailableError();
+        lease.anchor = anchor;
         await this.assertAttachedConversation(key, lease, page);
       } else {
         const identity = attachedConversationIdentity(page.url());
@@ -5313,7 +5347,7 @@ export class ChatGptBrowserWorker {
               page,
               stage.text,
               false,
-              checkpoint => diagnostics.capture(page, `multipart-${index + 1}-${checkpoint}`),
+              (checkpoint, mismatch) => diagnostics.capture(page, `multipart-${index + 1}-${checkpoint}`, undefined, mismatch),
               turn.abortSignal ? AbortSignal.any([stageSignal, turn.abortSignal]) : stageSignal,
             ),
             chatGptSuspensionClock,
@@ -5425,7 +5459,7 @@ export class ChatGptBrowserWorker {
                 mode.localTools,
                 turn.compaction === true,
                 submissionBaseline,
-                checkpoint => diagnostics.capture(page, checkpoint),
+                (checkpoint, mismatch) => diagnostics.capture(page, checkpoint, undefined, mismatch),
                 promptAbortSignal,
                 catalogRefreshAvailable,
                 connectorAttemptBudget,
