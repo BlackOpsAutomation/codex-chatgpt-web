@@ -238,6 +238,14 @@ and the observed disabled control structure are recognized as the single Instant
 position. Other ambiguous or locked controls still fail closed; the checked
 GPT-5.6 Sol row and exact effort announcement must independently match before Send.
 
+For the sibling OMP bridge, reasoning is captured separately for each model turn.
+A changed OMP setting applies to the next physical Send, including a tool-result
+continuation, not to the running turn. The bridge's session lifecycle connection
+retains the verified conversation/page/lease across completed user turns and
+releases abandoned ownership on OMP task cancellation or session disconnect.
+The browser worker's existing per-Send model/effort and retained-identity checks
+remain authoritative; Chrome/Xvfb are not restarted for task cleanup.
+
 
 ### Browser-backed OMP launch
 
