@@ -7,6 +7,33 @@
 export const ATTACHED_CONVERSATION_LEASE_KEY = /^[A-Za-z0-9_-]{8,128}$/;
 export const ATTACHED_LEASE_MARKER_PROPERTY = "__codexAttachedConversationLease";
 
+export interface OwnedPageClosePlan {
+  /** CDP target to close. Absent means do not close any target. */
+  closeTargetId?: string;
+  /** Owned target is the browser's only page; open an unowned keeper before closing it. */
+  keepBrowserAlive: boolean;
+}
+
+/**
+ * Decide whether a final lease release may close a page.
+ * Ownership is the recorded target, never a URL or a tab count.
+ * An uncertain or shared target stays open. This does not close Chrome.
+ */
+export function planOwnedPageClose(input: {
+  owned?: { targetId?: string; createdByBridge?: boolean; ownerKey: string };
+  openTargetIds: readonly string[];
+  leasesUsingTarget: readonly string[];
+}): OwnedPageClosePlan {
+  const owned = input.owned;
+  if (owned?.createdByBridge !== true || !owned.targetId) return { keepBrowserAlive: false };
+  if (!input.openTargetIds.includes(owned.targetId)) return { keepBrowserAlive: false };
+  if (input.leasesUsingTarget.some(key => key !== owned.ownerKey)) return { keepBrowserAlive: false };
+  return {
+    closeTargetId: owned.targetId,
+    keepBrowserAlive: input.openTargetIds.every(id => id === owned.targetId),
+  };
+}
+
 /** Bind the observed conversation route, including Temporary Chat when it has no /c/<id>. */
 export function attachedConversationIdentity(url: string): string | undefined {
   try {

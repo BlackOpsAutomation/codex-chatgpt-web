@@ -404,3 +404,238 @@ test("close drains acquisition and closes only its owned page without killing ex
   expect(unrelated.closes()).toBe(0);
   expect(harness.killed()).toBe(false);
 });
+
+test("owned page close uses the recorded target and leaves manual targets and Chrome alone", async () => {
+  const harness = workerFor("attached-chrome");
+  const worker = harness.worker as typeof harness.worker & {
+    readCreatedTargetId(page: unknown): Promise<string | undefined>;
+    listOpenPageTargetIds(): Promise<string[] | undefined>;
+    closePageTarget(targetId: string): Promise<boolean>;
+    openUnownedBrowserKeeper(): Promise<void>;
+  };
+  const open = new Map<string, boolean>([["manual-tab", true]]);
+  const closed: string[] = [];
+  let keepers = 0;
+  let next = 0;
+  worker.readCreatedTargetId = async () => {
+    const id = `owned-${++next}`;
+    open.set(id, true);
+    return id;
+  };
+  worker.listOpenPageTargetIds = async () => [...open.entries()].filter(([, isOpen]) => isOpen).map(([id]) => id);
+  worker.closePageTarget = async targetId => {
+    if (targetId === "manual-tab" || !open.has(targetId)) return false;
+    closed.push(targetId);
+    open.set(targetId, false);
+    return true;
+  };
+  worker.openUnownedBrowserKeeper = async () => {
+    keepers += 1;
+    open.set(`keeper-${keepers}`, true);
+  };
+
+  await harness.worker.run(turn());
+  await harness.worker.run(turn({ requireRetainedConversation: true }));
+  expect(harness.created()).toBe(1);
+  expect(harness.page.closes()).toBe(0);
+  await harness.worker.releaseAttachedConversation("lease_test_key");
+  await harness.worker.releaseAttachedConversation("lease_test_key");
+  expect(closed).toEqual(["owned-1"]);
+  expect(harness.page.closes()).toBe(1);
+  expect(open.get("manual-tab")).toBe(true);
+  expect(keepers).toBe(0);
+  expect(harness.killed()).toBe(false);
+
+  const pageA = leasePage();
+  const pageB = leasePage();
+  const split = workerFor("attached-chrome", pageA);
+  const splitWorker = split.worker as typeof worker;
+  const splitOpen = new Map<string, boolean>([["manual-tab", true]]);
+  const splitClosed: string[] = [];
+  let splitNext = 0;
+  split.worker.pageForNewTurn = async () => splitNext === 0 ? pageA : pageB;
+  splitWorker.readCreatedTargetId = async () => {
+    const id = splitNext++ === 0 ? "owner-a" : "owner-b";
+    splitOpen.set(id, true);
+    return id;
+  };
+  splitWorker.listOpenPageTargetIds = async () => [...splitOpen.entries()].filter(([, isOpen]) => isOpen).map(([id]) => id);
+  splitWorker.closePageTarget = async targetId => {
+    if (targetId === "manual-tab") return false;
+    splitClosed.push(targetId);
+    splitOpen.set(targetId, false);
+    return true;
+  };
+  splitWorker.openUnownedBrowserKeeper = async () => { throw new Error("keeper must not open while another page exists"); };
+  await split.worker.run(turn({ conversationKey: "lease_owner_a" }));
+  await split.worker.run(turn({ conversationKey: "lease_owner_b" }));
+  await split.worker.releaseAttachedConversation("lease_owner_a");
+  expect(splitClosed).toEqual(["owner-a"]);
+  expect(pageA.closes()).toBe(1);
+  expect(pageB.closes()).toBe(0);
+  expect(splitOpen.get("manual-tab")).toBe(true);
+  expect(splitOpen.get("owner-b")).toBe(true);
+  await split.worker.releaseAttachedConversation("lease_owner_b");
+  expect(splitClosed).toEqual(["owner-a", "owner-b"]);
+  expect(split.killed()).toBe(false);
+});
+
+test("a stale closed handle still closes the recorded target, and the last tab keeps Chrome alive", async () => {
+  const harness = workerFor("attached-chrome");
+  const worker = harness.worker as typeof harness.worker & {
+    readCreatedTargetId(page: unknown): Promise<string | undefined>;
+    listOpenPageTargetIds(): Promise<string[] | undefined>;
+    closePageTarget(targetId: string): Promise<boolean>;
+    openUnownedBrowserKeeper(): Promise<void>;
+  };
+  const open = new Set(["owned-only"]);
+  const closed: string[] = [];
+  let keepers = 0;
+  worker.readCreatedTargetId = async () => "owned-only";
+  worker.listOpenPageTargetIds = async () => [...open];
+  worker.closePageTarget = async targetId => {
+    closed.push(targetId);
+    open.delete(targetId);
+    return !open.has(targetId);
+  };
+  worker.openUnownedBrowserKeeper = async () => {
+    keepers += 1;
+    open.add("keeper");
+  };
+  await harness.worker.run(turn());
+  await harness.page.close();
+  await harness.worker.releaseAttachedConversation("lease_test_key");
+  await harness.worker.releaseAttachedConversation("lease_test_key");
+  expect(closed).toEqual(["owned-only"]);
+  expect(keepers).toBe(1);
+  expect(open.has("keeper")).toBe(true);
+  expect(harness.page.closes()).toBe(1);
+  expect(harness.killed()).toBe(false);
+});
+
+test("CDP close waits for a delayed target removal and does not close another target", async () => {
+  const harness = workerFor("attached-chrome");
+  const worker = harness.worker as typeof harness.worker & {
+    readCreatedTargetId(page: unknown): Promise<string | undefined>;
+    listOpenPageTargetIds(): Promise<string[] | undefined>;
+    browser: {
+      newBrowserCDPSession?: () => Promise<{
+        send(method: string, params?: { targetId?: string }): Promise<unknown>;
+        detach(): Promise<void>;
+      }>;
+    };
+  };
+  worker.readCreatedTargetId = async () => "owned-1";
+  worker.listOpenPageTargetIds = async () => ["manual-tab", "owned-1"];
+  let listings = 0;
+  const closed: string[] = [];
+  let detached = 0;
+  worker.browser.newBrowserCDPSession = async () => ({
+    send: async (method, params) => {
+      if (method === "Target.closeTarget") {
+        closed.push(params?.targetId ?? "");
+        return { success: true };
+      }
+      if (method !== "Target.getTargets") throw new Error(`unexpected ${method}`);
+      listings += 1;
+      return {
+        targetInfos: [
+          { type: "page", targetId: "manual-tab" },
+          ...(listings <= 3 ? [{ type: "page", targetId: "owned-1" }] : []),
+        ],
+      };
+    },
+    detach: async () => { detached += 1; },
+  });
+  await harness.worker.run(turn());
+  await harness.worker.releaseAttachedConversation("lease_test_key");
+  await harness.worker.releaseAttachedConversation("lease_test_key");
+  expect(closed).toEqual(["owned-1"]);
+  expect(listings).toBe(4);
+  expect(detached).toBe(1);
+  expect(harness.page.closes()).toBe(1);
+  expect(harness.killed()).toBe(false);
+
+  const absent = workerFor("attached-chrome");
+  const absentWorker = absent.worker as typeof worker;
+  let absentCloses = 0;
+  let absentDetached = 0;
+  absentWorker.browser.newBrowserCDPSession = async () => ({
+    send: async method => {
+      if (method === "Target.closeTarget") {
+        absentCloses += 1;
+        return { success: true };
+      }
+      return { targetInfos: [{ type: "page", targetId: "manual-tab" }] };
+    },
+    detach: async () => { absentDetached += 1; },
+  });
+  const gone = await (absentWorker as unknown as { closePageTarget(id: string): Promise<boolean> })
+    .closePageTarget("owned-1");
+  expect(gone).toBe(true);
+  expect(absentCloses).toBe(0);
+  expect(absentDetached).toBe(1);
+});
+
+test("CDP close fails closed when the recorded target remains past the settle deadline", async () => {
+  const harness = workerFor("attached-chrome");
+  const worker = harness.worker as typeof harness.worker & {
+    readCreatedTargetId(page: unknown): Promise<string | undefined>;
+    listOpenPageTargetIds(): Promise<string[] | undefined>;
+    ownedTargetCloseTiming(): {
+      now: () => number;
+      sleep: (ms: number) => Promise<void>;
+      deadlineMs: number;
+      intervalMs: number;
+    };
+    browser: {
+      newBrowserCDPSession?: () => Promise<{
+        send(method: string, params?: { targetId?: string }): Promise<unknown>;
+        detach(): Promise<void>;
+      }>;
+    };
+  };
+  worker.readCreatedTargetId = async () => "owned-stuck";
+  worker.listOpenPageTargetIds = async () => ["manual-tab", "owned-stuck"];
+  let now = 5_000;
+  const closed: string[] = [];
+  let listings = 0;
+  let detached = 0;
+  worker.ownedTargetCloseTiming = () => ({
+    now: () => now,
+    sleep: async ms => { now += ms; },
+    deadlineMs: 1_500,
+    intervalMs: 100,
+  });
+  worker.browser.newBrowserCDPSession = async () => ({
+    send: async (method, params) => {
+      if (method === "Target.closeTarget") {
+        closed.push(params?.targetId ?? "");
+        return { success: true };
+      }
+      if (method !== "Target.getTargets") throw new Error(`unexpected ${method}`);
+      listings += 1;
+      return {
+        targetInfos: [
+          { type: "page", targetId: "manual-tab" },
+          { type: "page", targetId: "owned-stuck" },
+        ],
+      };
+    },
+    detach: async () => { detached += 1; },
+  });
+  await harness.worker.run(turn());
+  let message = "";
+  try {
+    await harness.worker.releaseAttachedConversation("lease_test_key");
+  } catch (error) {
+    message = error instanceof Error ? error.message : "";
+  }
+  expect(message).toBe("Owned Temporary Chat page did not close");
+  expect(closed).toEqual(["owned-stuck"]);
+  expect(listings).toBeGreaterThan(2);
+  expect(now).toBe(6_500);
+  expect(detached).toBe(1);
+  expect(harness.page.closes()).toBe(1);
+  expect(harness.killed()).toBe(false);
+});

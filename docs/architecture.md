@@ -145,7 +145,9 @@ after completion. A same-document SPA conversation change fails closed even if t
 Model-family verification still runs before Send. Missing or ambiguous outer identity, changed route,
 a closed page, missing marker, abort, or failed turn releases that lease instead of opening a
 replacement chat. The lease never adopts an existing tab. Release and worker close touch only pages
-the lease created; `browser.close()`
+the lease created, and a recorded CDP target is closed even if the Playwright handle is already gone.
+A manual target is never selected. If the owned page is the only page target, an unowned about:blank
+is opened first so external Chrome stays up; that keeper is not owned and is not closed. `browser.close()`
 only disconnects CDP and does not terminate external Chrome. `storage-state.json` and its verification
 marker are not required.
 Authentication bootstrap stays outside this mode: a CDP connection alone is not authenticated-session

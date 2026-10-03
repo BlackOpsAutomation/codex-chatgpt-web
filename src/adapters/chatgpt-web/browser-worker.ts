@@ -106,6 +106,7 @@ import {
   attachedConversationLeaseRequested,
   attachedConversationIdentity,
   attachedLeaseMarker,
+  planOwnedPageClose,
   readAttachedLeaseMarker,
   readAttachedConversationAnchor,
   stampAttachedLeaseMarker,
@@ -2276,6 +2277,9 @@ export class ChatGptBrowserWorker {
   private readonly activeRuns = new Map<string, Promise<string>>();
   private readonly attachedOwnedPages = new Map<string, {
     page?: Page;
+    /** CDP target of the page this lease created. Never inferred from a URL. */
+    targetId?: string;
+    createdByBridge: true;
     marker: string;
     identity?: string;
     anchor?: string;
@@ -4777,7 +4781,7 @@ export class ChatGptBrowserWorker {
     owned.cancelled = true;
     owned.closing ??= (async () => {
       await owned.acquisition?.catch(() => {});
-      if (owned.page && !owned.page.isClosed()) await owned.page.close();
+      await this.closeBridgeOwnedPage(conversationKey, owned);
       if (this.attachedOwnedPages.get(conversationKey) === owned) {
         this.attachedOwnedPages.delete(conversationKey);
       }
@@ -4794,6 +4798,151 @@ export class ChatGptBrowserWorker {
   private async releaseOwnedAttachedPages(): Promise<void> {
     await Promise.all([...this.attachedOwnedPages.keys()].map(key => this.releaseAttachedConversation(key)));
   }
+
+  /**
+   * Close the page this lease created. A recorded CDP target is closed even when
+   * the Playwright handle is already gone. Other targets, Chrome, and Xvfb stay up.
+   */
+  private async closeBridgeOwnedPage(
+    conversationKey: string,
+    owned: { page?: Page; targetId?: string; createdByBridge: true },
+  ): Promise<void> {
+    const openTargetIds = owned.targetId ? await this.listOpenPageTargetIds() : undefined;
+    if (owned.targetId && openTargetIds) {
+      const leasesUsingTarget = [...this.attachedOwnedPages.entries()]
+        .filter(([, entry]) => entry.targetId === owned.targetId)
+        .map(([key]) => key);
+      const plan = planOwnedPageClose({
+        owned: { targetId: owned.targetId, createdByBridge: owned.createdByBridge, ownerKey: conversationKey },
+        openTargetIds,
+        leasesUsingTarget,
+      });
+      if (!plan.closeTargetId && openTargetIds.includes(owned.targetId)
+        && leasesUsingTarget.some(key => key !== conversationKey)) {
+        return;
+      }
+      if (plan.keepBrowserAlive) await this.openUnownedBrowserKeeper();
+      try {
+        await this.closeOwnedHandle(owned.page, true);
+      } catch (error) {
+        if (!plan.closeTargetId || !await this.closePageTarget(plan.closeTargetId)) throw error;
+        return;
+      }
+      if (plan.closeTargetId && !await this.closePageTarget(plan.closeTargetId)) {
+        throw new Error("Owned Temporary Chat page did not close");
+      }
+      return;
+    }
+    await this.closeOwnedHandle(owned.page, false);
+  }
+
+  private async closeOwnedHandle(page: Page | undefined, bounded: boolean): Promise<void> {
+    if (!page || page.isClosed()) return;
+    if (!bounded) {
+      await page.close();
+      return;
+    }
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        page.close(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("owned page close timed out")), 5_000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async readCreatedTargetId(page: Page): Promise<string | undefined> {
+    try {
+      const context = page.context?.();
+      if (!context || typeof context.newCDPSession !== "function") return undefined;
+      const session = await context.newCDPSession(page);
+      try {
+        const info = await session.send("Target.getTargetInfo");
+        const id = info.targetInfo?.targetId;
+        return typeof id === "string" && id.length > 0 ? id : undefined;
+      } finally {
+        await session.detach().catch(() => {});
+      }
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Undefined means this process cannot see CDP targets, so only the owned handle may close. */
+  private async listOpenPageTargetIds(): Promise<string[] | undefined> {
+    const browser = this.browser;
+    if (!browser || typeof browser.newBrowserCDPSession !== "function") return undefined;
+    const session = await browser.newBrowserCDPSession();
+    try {
+      const listed = await session.send("Target.getTargets");
+      return listed.targetInfos.filter(info => info.type === "page").map(info => info.targetId);
+    } finally {
+      await session.detach().catch(() => {});
+    }
+  }
+
+  /** Close one recorded target. Already gone is success. Never selects another target. */
+  private async closePageTarget(targetId: string): Promise<boolean> {
+    const browser = this.browser;
+    if (!browser || typeof browser.newBrowserCDPSession !== "function") return false;
+    const session = await browser.newBrowserCDPSession();
+    try {
+      const listed = await session.send("Target.getTargets");
+      if (!listed.targetInfos.some(info => info.type === "page" && info.targetId === targetId)) return true;
+      await session.send("Target.closeTarget", { targetId });
+      return await this.pollOwnedTargetClosed(() => session.send("Target.getTargets"), targetId);
+    } finally {
+      await session.detach().catch(() => {});
+    }
+  }
+
+  /**
+   * closeTarget can return before Chrome drops the target. Poll that target only,
+   * for at most 1.5s. A missing target is success. Do not send closeTarget again.
+   */
+  private async pollOwnedTargetClosed(
+    list: () => Promise<{ targetInfos: ReadonlyArray<{ type: string; targetId?: string }> }>,
+    targetId: string,
+  ): Promise<boolean> {
+    const timing = this.ownedTargetCloseTiming();
+    const deadline = timing.now() + timing.deadlineMs;
+    for (;;) {
+      const listed = await list();
+      if (!listed.targetInfos.some(info => info.type === "page" && info.targetId === targetId)) return true;
+      const remaining = deadline - timing.now();
+      if (remaining <= 0) return false;
+      await timing.sleep(Math.min(timing.intervalMs, remaining));
+    }
+  }
+
+  private ownedTargetCloseTiming(): {
+    now: () => number;
+    sleep: (ms: number) => Promise<void>;
+    deadlineMs: number;
+    intervalMs: number;
+  } {
+    return {
+      now: Date.now,
+      sleep: ms => {
+        const { promise, resolve } = Promise.withResolvers<void>();
+        setTimeout(resolve, ms);
+        return promise;
+      },
+      deadlineMs: 1_500,
+      intervalMs: 75,
+    };
+  }
+
+  /** Unowned about:blank so closing the last owned tab cannot quit external Chrome. */
+  private async openUnownedBrowserKeeper(): Promise<void> {
+    if (!this.context) return;
+    await this.context.newPage();
+  }
+
 
   private async assertAttachedConversation(
     key: string,
@@ -4828,20 +4977,22 @@ export class ChatGptBrowserWorker {
       owned.busy = true;
     } else {
       if (owned) throw new Error(`Attached conversation lease is already open: ${key}`);
-      owned = { marker: attachedLeaseMarker(key), busy: true, cancelled: false };
+      owned = { marker: attachedLeaseMarker(key), createdByBridge: true, busy: true, cancelled: false };
       this.attachedOwnedPages.set(key, owned);
     }
     const lease = owned;
     try {
       let page = lease.page;
       if (!page) {
-        lease.acquisition = this.pageForNewTurn().then(created => {
+        lease.acquisition = this.pageForNewTurn().then(async created => {
           lease.page = created;
+          lease.targetId = await this.readCreatedTargetId(created);
         });
         await lease.acquisition;
         page = lease.page;
       }
       if (!page || lease.cancelled || this.closing) throw chatGptRetainedConversationUnavailableError();
+      if (!lease.targetId) lease.targetId = await this.readCreatedTargetId(page);
       if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
       if (turn.requireRetainedConversation) {
         await this.assertAttachedConversation(key, lease, page);
