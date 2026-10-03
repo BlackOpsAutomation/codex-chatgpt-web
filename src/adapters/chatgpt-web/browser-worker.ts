@@ -965,7 +965,15 @@ export function chatGptGenerationErrorSignalsInPage(): ChatGptGenerationErrorBas
       && style.visibility !== "hidden"
       && (bounds.width > 0 || bounds.height > 0);
   };
-  const generationAlerts = [...document.querySelectorAll('[role="alert"]')].filter(visible);
+  const alertNodes = document.querySelectorAll('[role="alert"]');
+  const generationAlerts = [...alertNodes].filter(visible);
+  // Diagnostic attribution only. Include hidden nodes so later visibility is not "new".
+  // Failure to install this baseline must not affect the runtime count/visibility signals.
+  try {
+    (globalThis as typeof globalThis & {
+      __CODEX_WEB_GPT_ALERT_BASELINE__?: WeakSet<Element>;
+    }).__CODEX_WEB_GPT_ALERT_BASELINE__ = new WeakSet(alertNodes);
+  } catch { /* Detailed diagnostics are expendable. */ }
   return {
     regenerateVisible: [...document.querySelectorAll('[data-testid="regenerate-thread-error-button"]')].some(visible),
     terminalTextVisible: generationAlerts.some(element => (
@@ -1876,6 +1884,59 @@ export function redactChatGptUiDiagnostic(value: string): string {
     .replace(/\b(turn|binding|call)_[A-Za-z0-9_-]{12,}\b/g, "$1_[redacted]");
 }
 
+interface ChatGptConversationAlertDiagnostic {
+  tag: string;
+  role: string | null;
+  dataTestId: string | null;
+  ariaLabel: string | null;
+  rect: { x: number; y: number; width: number; height: number };
+  rendered: boolean;
+  text: string;
+  textChars: number;
+  truncated: boolean;
+  buttonLabels: string[];
+}
+
+const chatGptConversationAlertEvidence = new WeakMap<object, ChatGptConversationAlertDiagnostic[]>();
+
+// Pending collection is internal only; it is never serialized or awaited by runtime classification.
+const chatGptPendingAlertEvidence = new WeakMap<object, Promise<void>>();
+// Keep this defense-in-depth sanitizer aligned with the page-local capture below.
+// Quoted values consume escape pairs, not escaped delimiters. An unclosed value (including
+// a lone trailing backslash at the inspection bound) is redacted through the inspected end.
+function sanitizeChatGptAlertString(value: string, limit: number): string {
+  return value.slice(0, 16_384).replace(/\s+/g, " ").trim()
+    .replace(/["']?\b(?:authorization|api[_ -]?\s*key|access[_ -]?\s*token|refresh[_ -]?\s*token|token|password|secret)["']?\s*[:=]\s*(?:(?:bearer|basic)\s+)?(?:"(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'(?:\\[\s\S]|[^'\\])*(?:'|\\?$)|[^\s,;}]+)/gi, "[redacted]")
+    .replace(/\b(?:bearer|basic)\s+(?:"(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'(?:\\[\s\S]|[^'\\])*(?:'|\\?$)|[^\s,;}]+)/gi, "[redacted]")
+    .replace(/\b(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]+/g, "[redacted]")
+    .replace(/[A-Za-z0-9_+/=-]{32,}/g, "[redacted]")
+    .slice(0, limit);
+}
+
+function sanitizeChatGptConversationAlert(value: unknown): unknown {
+  if (!value || typeof value !== "object") return undefined;
+  const row = value as Record<string, unknown>;
+  if (row.tag !== "aside" || row.role !== "alert") return undefined;
+  const rect = row.rect as Record<string, unknown> | undefined;
+  return {
+    tag: "aside", role: "alert",
+    ...Object.fromEntries(["dataTestId", "ariaLabel", "text"].flatMap(key =>
+      typeof row[key] === "string"
+        ? [[key, sanitizeChatGptAlertString(row[key], key === "text" ? 500 : 80)]]
+        : [])),
+    rect: Object.fromEntries(["x", "y", "width", "height"].flatMap(key =>
+      typeof rect?.[key] === "number" && Number.isFinite(rect[key]) ? [[key, rect[key]]] : [])),
+    rendered: row.rendered === true,
+    textChars: typeof row.textChars === "number" && Number.isSafeInteger(row.textChars) && row.textChars >= 0
+      ? row.textChars : 0,
+    truncated: row.truncated === true,
+    buttonLabels: Array.isArray(row.buttonLabels)
+      ? row.buttonLabels.slice(0, 8).filter((label): label is string => typeof label === "string")
+        .map(label => sanitizeChatGptAlertString(label, 80))
+      : [],
+  };
+}
+
 const CHATGPT_DIAGNOSTIC_SAFE_STRING_KEYS = new Set([
   "tag",
   "role",
@@ -1886,12 +1947,17 @@ const CHATGPT_DIAGNOSTIC_SAFE_STRING_KEYS = new Set([
   "origin",
 ]);
 
-/** Defense in depth: persisted browser traces contain structure, never rendered UI text. */
+/** Structure only, except the explicitly scoped, bounded conversation-alert evidence. */
 export function sanitizeChatGptBrowserDiagnosticState(value: unknown): unknown {
   if (value === null || typeof value === "number" || typeof value === "boolean") return value;
   if (Array.isArray(value)) return value.map(sanitizeChatGptBrowserDiagnosticState);
   if (!value || typeof value !== "object") return undefined;
   return Object.fromEntries(Object.entries(value).flatMap(([key, candidate]) => {
+    if (key === "conversationAlerts") {
+      return Array.isArray(candidate)
+        ? [[key, candidate.slice(0, 8).map(sanitizeChatGptConversationAlert).filter(Boolean)]]
+        : [];
+    }
     if (typeof candidate === "string") {
       return CHATGPT_DIAGNOSTIC_SAFE_STRING_KEYS.has(key) && candidate.length <= 200
         ? [[key, candidate]]
@@ -1943,7 +2009,7 @@ class ChatGptBrowserDiagnostics {
     this.directory = join(this.root, `${traceId}-${randomUUID().slice(0, 8)}`);
   }
 
-  async capture(page: Page, checkpoint: string, error?: unknown, mismatch?: PromptMismatchDiagnostic): Promise<void> {
+  async capture(page: Page | undefined, checkpoint: string, error?: unknown, mismatch?: PromptMismatchDiagnostic): Promise<void> {
     try {
       if (!this.initialized) {
         privateDirectory(this.root);
@@ -1962,12 +2028,17 @@ class ChatGptBrowserDiagnostics {
         console.info(`[chatgpt-web] browser diagnostic trace=${this.traceId} checkpoint=${stem} path=${this.directory}`);
         return;
       }
+      if (error && typeof error === "object") await chatGptPendingAlertEvidence.get(error);
+      const alertEvidence = error && typeof error === "object"
+        ? chatGptConversationAlertEvidence.get(error) : undefined;
+      // Evidence is already plain sanitized data. Never require another DOM scan to persist it.
+      const snapshotPage = alertEvidence || !page || page.isClosed() ? undefined : page;
       const includeScreenshot = process.env.CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS === "1";
       const [screenshotResult, stateResult] = await Promise.allSettled([
-        includeScreenshot
-          ? page.screenshot({ animations: "disabled", caret: "hide", timeout: 5_000, type: "png" })
+        includeScreenshot && snapshotPage
+          ? snapshotPage.screenshot({ animations: "disabled", caret: "hide", timeout: 5_000, type: "png" })
           : Promise.resolve(undefined),
-        withChatGptBrowserObservationTimeout(page.evaluate(({
+        snapshotPage ? withChatGptBrowserObservationTimeout(snapshotPage.evaluate(({
           composerSelector,
           effortControlSelector,
           effortItemSelector,
@@ -2125,7 +2196,7 @@ class ChatGptBrowserDiagnostics {
           stopButtonSelector: CHATGPT_STOP_BUTTON_SELECTOR,
           completionActionSelector: CHATGPT_COMPLETION_ACTION_SELECTOR,
           appName: this.appName,
-        })),
+        })) : Promise.resolve({}),
       ]);
       const capturedAt = new Date().toISOString();
       if (screenshotResult.status === "fulfilled" && screenshotResult.value) {
@@ -2153,9 +2224,10 @@ class ChatGptBrowserDiagnostics {
         ...(error !== undefined ? {
           error: redactChatGptUiDiagnostic(error instanceof Error ? error.message : String(error)),
         } : {}),
-        ...(stateResult.status === "fulfilled"
-          ? { state: sanitizeChatGptBrowserDiagnosticState(stateResult.value) }
-          : {}),
+        state: sanitizeChatGptBrowserDiagnosticState({
+          ...(stateResult.status === "fulfilled" ? stateResult.value : {}),
+          ...(alertEvidence ? { conversationAlerts: alertEvidence } : {}),
+        }),
         ...(Object.keys(captureErrors).length > 0 ? { captureErrors } : {}),
       }, null, 2)}\n`);
       if (Object.keys(captureErrors).length > 0) {
@@ -3072,6 +3144,65 @@ export class ChatGptBrowserWorker {
     }
   }
 
+  /** Secondary evidence only: the caller has already created the authoritative failure. */
+  private async captureConversationAlertEvidence(page: Page): Promise<ChatGptConversationAlertDiagnostic[]> {
+    try {
+      const rows = await withChatGptBrowserObservationTimeout(page.evaluate(() => {
+        const baseline = (globalThis as typeof globalThis & {
+          __CODEX_WEB_GPT_ALERT_BASELINE__?: WeakSet<Element>;
+        }).__CODEX_WEB_GPT_ALERT_BASELINE__;
+        // A replaced document has no trustworthy pre-Send attribution.
+        if (!baseline) return [];
+        // This callback is serialized into the page; keep redaction aligned with the host pass.
+        const sanitize = (value: string, limit: number): string => value.slice(0, 16_384).replace(/\s+/g, " ").trim()
+          .replace(/["']?\b(?:authorization|api[_ -]?\s*key|access[_ -]?\s*token|refresh[_ -]?\s*token|token|password|secret)["']?\s*[:=]\s*(?:(?:bearer|basic)\s+)?(?:"(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'(?:\\[\s\S]|[^'\\])*(?:'|\\?$)|[^\s,;}]+)/gi, "[redacted]")
+          .replace(/\b(?:bearer|basic)\s+(?:"(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'(?:\\[\s\S]|[^'\\])*(?:'|\\?$)|[^\s,;}]+)/gi, "[redacted]")
+          .replace(/\b(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]+/g, "[redacted]")
+          .replace(/[A-Za-z0-9_+/=-]{32,}/g, "[redacted]")
+          .slice(0, limit);
+        const contentSelector = '[data-turn-id-container], [data-turn-key], [data-message-author-role], [data-user-message-bubble], [data-conversation-role], [contenteditable], textarea';
+        const candidates = document.querySelectorAll('aside[role="alert"]');
+        const evidence = [];
+        for (let index = 0; index < Math.min(candidates.length, 128) && evidence.length < 8; index++) {
+          const element = candidates[index]!;
+          if (baseline.has(element) || !element.isConnected
+            // Positive identification uses the existing ChatGPT response-error control.
+            || !element.querySelector('[data-testid="regenerate-thread-error-button"]')
+            || element.closest(contentSelector) || element.querySelector(contentSelector)) continue;
+          const rect = element.getBoundingClientRect();
+          if (!element.isConnected || getComputedStyle(element).visibility === "hidden"
+            || !(rect.width > 0 || rect.height > 0)) continue;
+          const rawText = element.textContent ?? "";
+          // Do not normalize/sanitize unbounded source text just to truncate its result.
+          if (rawText.length > 16_384) continue;
+          const normalized = rawText.replace(/\s+/g, " ").trim();
+          const controls = element.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"]');
+          const buttonLabels = [];
+          for (let controlIndex = 0; controlIndex < Math.min(controls.length, 8); controlIndex++) {
+            const control = controls[controlIndex]!;
+            buttonLabels.push(sanitize(control.getAttribute("aria-label") ?? (control instanceof HTMLInputElement
+              ? control.value : control.textContent ?? ""), 80));
+          }
+          evidence.push({
+            tag: "aside", role: "alert",
+            dataTestId: sanitize(element.getAttribute("data-testid") ?? "", 80),
+            ariaLabel: sanitize(element.getAttribute("aria-label") ?? "", 80),
+            rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+            rendered: true,
+            text: sanitize(normalized, 500), textChars: normalized.length,
+            truncated: normalized.length > 500, buttonLabels,
+          });
+        }
+        return evidence;
+      }), 250);
+      // Only plain, allowlisted, bounded data is associated with an Error.
+      return (Array.isArray(rows) ? rows.slice(0, 8).map(sanitizeChatGptConversationAlert).filter(Boolean) : []) as ChatGptConversationAlertDiagnostic[];
+    } catch {
+      // Closed/detached page, DOM mutation, serializer or sanitizer failure: original error wins.
+      return [];
+    }
+  }
+
   private async submissionDomState(
     page: Page,
     cache?: ChatGptSubmissionDomCache,
@@ -3347,7 +3478,13 @@ export class ChatGptBrowserWorker {
         stopVisible: state.visibleStopButtonCount > 0,
       });
       // The message is already accepted. Classify the alert and stop; never press Send again.
-      if (unboundError) throw chatGptUnboundGenerationError(unboundError);
+      if (unboundError) {
+        const error = chatGptUnboundGenerationError(unboundError);
+        chatGptPendingAlertEvidence.set(error, this.captureConversationAlertEvidence(observationPage).then(evidence => {
+          if (evidence.length > 0) chatGptConversationAlertEvidence.set(error, evidence);
+        }));
+        throw error;
+      }
       // A delayed renderer wake can cross the grace while the assistant appears. Only a fresh
       // observation can prove it is still missing; the explicit turn deadline remains above.
       if (Date.now() >= responseDeadline
@@ -6088,7 +6225,22 @@ export class ChatGptBrowserWorker {
     } catch (error) {
       if (!(error instanceof DOMException && error.name === "AbortError")
         && !(error instanceof ChatGptWebAdapterError && error.code === "client_cancelled")) {
+        const originalError = error;
         error = await submissionRejection.failure() ?? error;
+        // Preserve the existing 413 precedence without dropping diagnostic data.
+        if (originalError && typeof originalError === "object" && error && typeof error === "object"
+          && error !== originalError) {
+          const authoritativeError = error;
+          const evidence = chatGptConversationAlertEvidence.get(originalError);
+          if (evidence) chatGptConversationAlertEvidence.set(error, evidence);
+          const pending = chatGptPendingAlertEvidence.get(originalError);
+          if (pending) {
+            chatGptPendingAlertEvidence.set(authoritativeError, pending.then(() => {
+              const captured = chatGptConversationAlertEvidence.get(originalError);
+              if (captured) chatGptConversationAlertEvidence.set(authoritativeError, captured);
+            }));
+          }
+        }
       }
       if (error instanceof DOMException && error.name === "AbortError"
         && turn.abortSignal?.reason instanceof ChatGptCompactionHandoffAccepted) {
@@ -6102,7 +6254,8 @@ export class ChatGptBrowserWorker {
         `[chatgpt-web] browser turn ${turn.traceId} failed:`
         + ` ${redactChatGptUiDiagnostic(error instanceof Error ? error.message : String(error))}`,
       );
-      if (diagnosticPage && !diagnosticPage.isClosed()) {
+      if (diagnosticPage || (error && typeof error === "object"
+        && (chatGptConversationAlertEvidence.has(error) || chatGptPendingAlertEvidence.has(error)))) {
         await diagnostics.capture(diagnosticPage, "turn-failed", error);
       }
       throw error;

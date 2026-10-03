@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1208,9 +1208,798 @@ test("a new conversation alert after Send fails closed without waiting or resend
   expect(chatGptUnboundGenerationError("terminal_text").message).toContain("Do not resend");
 });
 
+type ConversationAlertEvidence = {
+  tag: string; role: string; dataTestId: string; ariaLabel: string;
+  rect: { x: number; y: number; width: number; height: number };
+  rendered: boolean; text: string; textChars: number; truncated: boolean; buttonLabels: string[];
+};
+type ConversationAlertWorker = {
+  captureConversationAlertEvidence(page: Page): Promise<ConversationAlertEvidence[]>;
+  waitForNewAssistantTurn(page: Page, baseline: unknown, deadline: undefined): Promise<{ identity: string }>;
+  submissionDomState(page: Page): Promise<Record<string, unknown>>;
+};
+
+type ConversationAlertFixture = {
+  window: { document: Document };
+  page: Page & EventEmitter;
+  worker: ConversationAlertWorker;
+  baseline: unknown;
+};
+
+
+function conversationAlertFixture(html: string): ConversationAlertFixture {
+  const { createWindow } = require("@mixmark-io/domino");
+  const window = createWindow(html);
+  window.Element.prototype.getBoundingClientRect = () => ({ x: 430.5, y: 855, width: 768, height: 66 });
+  const context = createContext({
+    performance: { timeOrigin: 1 },
+    document: window.document,
+    HTMLInputElement: window.HTMLInputElement,
+    getComputedStyle: (element: Element) => ({
+      visibility: element.getAttribute("data-hidden") === "true" ? "hidden" : "visible",
+    }),
+    MutationObserver: class { observe() {} },
+  });
+  const hiddenLocator = {
+    filter() { return this; }, last() { return this; }, isVisible: async () => false,
+    press: async () => { throw new Error("Retry or Send was pressed"); },
+    click: async () => { throw new Error("Retry was clicked"); },
+  };
+  const page = Object.assign(new EventEmitter(), {
+    evaluate: async (callback: Function, options: unknown) => runInContext(`(${callback.toString()})`, context)(options),
+    isClosed: () => false, locator: () => hiddenLocator, url: () => "https://chatgpt.com/?temporary-chat=true",
+  }) as unknown as Page & EventEmitter;
+  // Test seam for private observation methods; the real prototype supplies both implementations.
+  const worker = Object.create(ChatGptBrowserWorker.prototype) as {
+    captureConversationAlertEvidence(page: Page): Promise<ConversationAlertEvidence[]>;
+    waitForNewAssistantTurn(page: Page, baseline: unknown, deadline: undefined): Promise<{ identity: string }>;
+    submissionDomState(page: Page): Promise<Record<string, unknown>>;
+  };
+  const baseline = {
+    initialTurnIdentities: [], domCache: {},
+    generationError: { regenerateVisible: false, terminalTextVisible: false, conversationAlertCount: 0 },
+  };
+  // Pre-Send baseline starts empty so fixture alerts are diagnostically new.
+  runInContext("globalThis.__CODEX_WEB_GPT_ALERT_BASELINE__ = new WeakSet()", context);
+  return { window, page, worker, baseline };
+}
+
+test("conversation alert evidence is local, normalized, identified and dimensioned", async () => {
+  const { page, worker } = conversationAlertFixture(`
+    <p>private surrounding prompt and tool result</p><button>Unrelated page button</button>
+    <aside role="alert" aria-label="Conversation error">
+      Unable   to generate
+      response. <button data-testid="regenerate-thread-error-button">Retry</button><button aria-label="Dismiss"></button>
+    </aside>`);
+  const [alert] = await worker.captureConversationAlertEvidence(page);
+  expect(alert).toEqual({
+    tag: "aside", role: "alert", dataTestId: "", ariaLabel: "Conversation error",
+    rect: { x: 430.5, y: 855, width: 768, height: 66 }, rendered: true,
+    text: "Unable to generate response. Retry", textChars: 34, truncated: false,
+    buttonLabels: ["Retry", "Dismiss"],
+  });
+  expect(JSON.stringify(alert)).not.toContain("private");
+  expect(JSON.stringify(alert)).not.toContain("Unrelated");
+});
+
+test("alert text and controls have strict bounds with original normalized length", async () => {
+  const text = Array.from({ length: 110 }, () => "error").join("   ");
+  const controls = Array.from({ length: 12 }, (_, index) =>
+    `<button aria-label="${index} ${"label ".repeat(30)}"></button>`).join("");
+  const { page, worker } = conversationAlertFixture(`<aside role="alert"><button data-testid="regenerate-thread-error-button">Retry</button>  ${text}  ${controls}</aside>`);
+  const [alert] = await worker.captureConversationAlertEvidence(page);
+  expect(alert.text).toHaveLength(500);
+  expect(alert.textChars).toBe(665);
+  expect(alert.truncated).toBe(true);
+  expect(alert.buttonLabels).toHaveLength(8);
+  expect(alert.buttonLabels.map(label => label.split(" ")[0])).toEqual(["Retry", "0", "1", "2", "3", "4", "5", "6"]);
+  expect(alert.buttonLabels.every(label => label.length <= 80)).toBe(true);
+});
+
+test("quoted assignments and JSON credentials are fully redacted in every retained string", async () => {
+  const cases = [
+    'Authorization: Bearer "secret value"', 'Authorization: Basic "secret value"',
+    'authorization = "Bearer secret value"', 'api_key = "secret value"',
+    'api key: "secret value"', 'access_token = "secret value"', 'access-token: "secret value"',
+    'refresh_token: "secret value"', 'password = "secret value"', 'secret: "secret value"',
+    '{"token":"secret value"}', '{"password":"secret value"}', '{"api_key":"secret value"}',
+    '{"PaSsWoRd" : "secret value"}', 'AuThOrIzAtIoN\n =\n "Bearer secret value"',
+    "PASSWORD = 'secret value'", 'access-\n token : "secret value"',
+  ];
+  for (const credential of cases) {
+    const fixture = conversationAlertFixture(alertFixtureHtml);
+    const aside = fixture.window.document.querySelector("aside")!;
+    aside.setAttribute("data-testid", credential);
+    aside.setAttribute("aria-label", credential);
+    const control = aside.querySelector("button")!;
+    control.setAttribute("aria-label", credential);
+    aside.insertBefore(fixture.window.document.createTextNode(credential), control);
+    const [captured] = await fixture.worker.captureConversationAlertEvidence(fixture.page);
+    // The in-process sanitizer deliberately returns unknown; these assertions check its output contract.
+    const persisted = sanitizeChatGptBrowserDiagnosticState({
+      conversationAlerts: [{
+        tag: "aside", role: "alert", text: credential, ariaLabel: credential,
+        dataTestId: credential, buttonLabels: [credential],
+      }],
+    }) as { conversationAlerts: ConversationAlertEvidence[] };
+    for (const row of [captured, persisted.conversationAlerts[0]!]) {
+      for (const value of [row.text, row.ariaLabel, row.dataTestId, ...row.buttonLabels]) {
+        expect(value).not.toContain("secret value");
+        expect(value).not.toContain("secret");
+      }
+    }
+  }
+});
+
+test("escaped quoted credentials leave only safe structure in page and persistence evidence", async () => {
+  const cases = [
+    [String.raw`{"password":"abc\" def secretSuffix"}`, "{[redacted]}"],
+    [String.raw`{"token":"abc\\\" def tokenSuffix"}`, "{[redacted]}"],
+    [String.raw`{"api_key":"abc\\\\def"}`, "{[redacted]}"],
+    [String.raw`password="abc"`, "[redacted]"],
+    [String.raw`password="abc def"`, "[redacted]"],
+    [String.raw`password="abc\\def"`, "[redacted]"],
+    [String.raw`password="abc\\"`, "[redacted]"],
+    [String.raw`password='abc'`, "[redacted]"],
+    [String.raw`password='abc def'`, "[redacted]"],
+    [String.raw`password='abc\' def secretSuffix'`, "[redacted]"],
+    [String.raw`token='abc\\\' def tokenSuffix'`, "[redacted]"],
+    [String.raw`password='abc\\def'`, "[redacted]"],
+    [String.raw`password='abc\\'`, "[redacted]"],
+    [String.raw`Authorization: Bearer "abc\" def secretSuffix"`, "[redacted]"],
+    [String.raw`Authorization: Basic "abc\\\" def secretSuffix"`, "[redacted]"],
+    [String.raw`AuThOrIzAtIoN = bEaReR 'abc\' def secretSuffix'`, "[redacted]"],
+    [String.raw`Bearer "abc\" def secretSuffix"`, "[redacted]"],
+    [String.raw`Basic 'abc\\\' def secretSuffix'`, "[redacted]"],
+    [String.raw`{"PaSsWoRd":"abc\' def secretSuffix"}`, "{[redacted]}"],
+    [String.raw`SeCrEt='abc\" def secretSuffix'`, "[redacted]"],
+  ];
+  for (const [credential, structure] of cases) {
+    const input = `safe ${credential} end`;
+    const expected = `safe ${structure} end`;
+    const fixture = conversationAlertFixture(
+      '<aside role="alert"><button data-testid="regenerate-thread-error-button"></button></aside>');
+    const aside = fixture.window.document.querySelector("aside")!;
+    aside.setAttribute("data-testid", input);
+    aside.setAttribute("aria-label", input);
+    const control = aside.querySelector("button")!;
+    control.setAttribute("aria-label", input);
+    aside.insertBefore(fixture.window.document.createTextNode(input), control);
+    let pageRows: ConversationAlertEvidence[] = [];
+    const evaluate = fixture.page.evaluate.bind(fixture.page);
+    fixture.page.evaluate = async (...args: Parameters<Page["evaluate"]>) => {
+      const rows = await evaluate(...args);
+      pageRows = rows as ConversationAlertEvidence[];
+      return rows;
+    };
+    const [collected] = await fixture.worker.captureConversationAlertEvidence(fixture.page);
+    const raw = {
+      tag: "aside", role: "alert", text: input, dataTestId: input, ariaLabel: input, buttonLabels: [input],
+    };
+    // Raw input proves host redaction independently; pageRows observes the serialized callback
+    // before capture's defense-in-depth host pass could conceal a page-side leak.
+    const persistedRows = [raw, collected].map(value => {
+      // The sanitizer's in-process unknown result is checked by the exact field assertions below.
+      const state = sanitizeChatGptBrowserDiagnosticState({ conversationAlerts: [value] }) as {
+        conversationAlerts: ConversationAlertEvidence[];
+      };
+      return state.conversationAlerts[0]!;
+    });
+    for (const row of [pageRows[0]!, collected!, ...persistedRows]) {
+      expect(row.text).toBe(expected);
+      expect(row.dataTestId).toBe(expected);
+      expect(row.ariaLabel).toBe(expected);
+      expect(row.buttonLabels).toEqual([expected]);
+    }
+  }
+});
+
+test("escaped quoted credentials remain redacted at the inspection boundary", async () => {
+  const prefix = String.raw`{"password":"abc\" `;
+  const suffix = String.raw`\\\" def secretSuffix"}`;
+  const cases = [
+    prefix + "x".repeat(16_384 - prefix.length - suffix.length) + suffix,
+    // The inspection slice ends on a lone backslash inside an unclosed secret.
+    '{"password":"' + "x".repeat(16_384 - '{"password":"'.length - 1) + String.raw`\" def secretSuffix"}`,
+  ];
+  for (const input of cases) {
+    const fixture = conversationAlertFixture(
+      '<aside role="alert"><button data-testid="regenerate-thread-error-button"></button></aside>');
+    const aside = fixture.window.document.querySelector("aside")!;
+    aside.setAttribute("data-testid", input);
+    aside.setAttribute("aria-label", input);
+    const control = aside.querySelector("button")!;
+    control.setAttribute("aria-label", input);
+    aside.insertBefore(fixture.window.document.createTextNode(input), control);
+    const rows = await fixture.worker.captureConversationAlertEvidence(fixture.page);
+    // The sanitizer's in-process unknown result is checked by the exact field assertions below.
+    const state = sanitizeChatGptBrowserDiagnosticState({ conversationAlerts: [{
+      tag: "aside", role: "alert", text: input, dataTestId: input, ariaLabel: input, buttonLabels: [input],
+    }] }) as { conversationAlerts: ConversationAlertEvidence[] };
+    const persisted = state.conversationAlerts[0]!;
+    expect(persisted.text).toBe(input.length === 16_384 ? "{[redacted]}" : "{[redacted]");
+    expect(persisted.dataTestId).toBe(persisted.text);
+    expect(persisted.ariaLabel).toBe(persisted.text);
+    expect(persisted.buttonLabels).toEqual([persisted.text]);
+    if (input.length === 16_384) {
+      expect(rows[0]!.text).toBe("{[redacted]}");
+      expect(rows[0]!.dataTestId).toBe("{[redacted]}");
+      expect(rows[0]!.ariaLabel).toBe("{[redacted]}");
+      expect(rows[0]!.buttonLabels).toEqual(["{[redacted]}"]);
+    } else {
+      expect(rows).toEqual([]);
+    }
+  }
+});
+
+test("copied conversation content and unrelated toast alerts are excluded from evidence", async () => {
+  for (const html of [
+    "<p>Healthy page</p><button>Retry</button>",
+    '<div data-turn-key="user"><aside role="alert"><button data-testid="regenerate-thread-error-button">Retry</button>private user quote</aside></div>',
+    '<aside role="alert"><button data-testid="regenerate-thread-error-button">Retry</button><div data-message-author-role="assistant">private assistant</div></aside>',
+    '<aside role="alert">copied prompt text and tool output</aside>',
+    '<aside role="alert">unrelated global toast</aside>',
+  ]) {
+    const { worker, page } = conversationAlertFixture(html);
+    expect(await worker.captureConversationAlertEvidence(page)).toEqual([]);
+  }
+});
+
+test("identified alert evidence can contain copied content as a bounded residual risk", async () => {
+  const { worker, page } = conversationAlertFixture(
+    '<aside role="alert"><button data-testid="regenerate-thread-error-button">Retry</button>copied prompt and tool output</aside>');
+  const [alert] = await worker.captureConversationAlertEvidence(page);
+  expect(alert.text).toContain("copied prompt and tool output");
+  expect(alert.text.length).toBeLessThanOrEqual(500);
+});
+
+test("assistant identity takes precedence over an unbound conversation alert", async () => {
+  const { worker, page, baseline } = conversationAlertFixture(`
+    <div data-turn-key="new"><h4 data-conversation-role="assistant"></h4></div>
+    <aside role="alert"><button data-testid="regenerate-thread-error-button">Retry</button>Unable to generate response</aside>`);
+  const binding = await worker.waitForNewAssistantTurn(page, baseline, undefined);
+  expect(binding.identity).toBe("group:assistant:new");
+});
+
+test("evidence excludes pre-Send nodes across append, prepend, replacement and same-node changes", async () => {
+  const { worker, page, window } = conversationAlertFixture(
+    '<aside role="alert"><button data-testid="regenerate-thread-error-button">Retry</button>Old alert</aside>');
+  await page.evaluate(chatGptGenerationErrorSignalsInPage);
+  const oldAlert = window.document.querySelector("aside")!;
+  expect(await worker.captureConversationAlertEvidence(page)).toEqual([]);
+  oldAlert.innerHTML = '<button data-testid="regenerate-thread-error-button">Retry</button>Changed old wording';
+  expect(await worker.captureConversationAlertEvidence(page)).toEqual([]);
+  const appended = window.document.createElement("aside");
+  appended.setAttribute("role", "alert");
+  appended.setAttribute("data-testid", "appended");
+  appended.innerHTML = '<button data-testid="regenerate-thread-error-button">Retry</button>Appended alert';
+  window.document.body.appendChild(appended);
+  expect((await worker.captureConversationAlertEvidence(page)).map(row => row.dataTestId)).toEqual(["appended"]);
+
+  const prepended = window.document.createElement("aside");
+  prepended.setAttribute("role", "alert");
+  prepended.setAttribute("data-testid", "prepended");
+  prepended.innerHTML = '<button data-testid="regenerate-thread-error-button">Retry</button>Prepended alert';
+  window.document.body.insertBefore(prepended, window.document.body.firstChild);
+  expect((await worker.captureConversationAlertEvidence(page)).map(row => row.dataTestId)).toEqual([
+    "prepended", "appended",
+  ]);
+
+  appended.remove();
+  const replacement = window.document.createElement("aside");
+  replacement.setAttribute("role", "alert");
+  replacement.setAttribute("data-testid", "replacement");
+  replacement.innerHTML = '<button data-testid="regenerate-thread-error-button">Retry</button>Replacement alert';
+  window.document.body.appendChild(replacement);
+  expect((await worker.captureConversationAlertEvidence(page)).map(row => row.dataTestId)).toEqual([
+    "prepended", "replacement",
+  ]);
+
+  replacement.innerHTML = '<button data-testid="regenerate-thread-error-button">Retry</button>Changed wording on the same node';
+  const mutated = await worker.captureConversationAlertEvidence(page);
+  expect(mutated.map(row => row.dataTestId)).toEqual(["prepended", "replacement"]);
+  expect(mutated[1]!.text).toContain("Changed wording on the same node");
+});
+
+test("hidden baseline alerts remain diagnostic baseline; refresh and reset do not infer evidence", async () => {
+  const { worker, page, window } = conversationAlertFixture(
+    '<aside role="alert" data-hidden="true"><button data-testid="regenerate-thread-error-button">Retry</button>Hidden old alert</aside>');
+  await page.evaluate(chatGptGenerationErrorSignalsInPage);
+  const hidden = window.document.querySelector("aside")!;
+  hidden.removeAttribute("data-hidden");
+  expect(await worker.captureConversationAlertEvidence(page)).toEqual([]);
+  hidden.remove();
+  expect(await worker.captureConversationAlertEvidence(page)).toEqual([]);
+
+  const fresh = window.document.createElement("aside");
+  fresh.setAttribute("role", "alert");
+  fresh.innerHTML = '<button data-testid="regenerate-thread-error-button">Retry</button>Fresh alert';
+  window.document.body.appendChild(fresh);
+  expect(await worker.captureConversationAlertEvidence(page)).toHaveLength(1);
+  await page.evaluate(chatGptGenerationErrorSignalsInPage);
+  expect(await worker.captureConversationAlertEvidence(page)).toEqual([]);
+  await page.evaluate(() => { delete (globalThis as typeof globalThis & {
+    __CODEX_WEB_GPT_ALERT_BASELINE__?: WeakSet<Element>;
+  }).__CODEX_WEB_GPT_ALERT_BASELINE__; });
+  expect(await worker.captureConversationAlertEvidence(page)).toEqual([]);
+});
+
+test("same-count replacement and same-node mutation do not redefine runtime alert classification", async () => {
+  const fixture = conversationAlertFixture(alertFixtureHtml);
+  hideRegenerateMarker(fixture);
+  const baseline = await fixture.page.evaluate(chatGptGenerationErrorSignalsInPage);
+  const old = fixture.window.document.querySelector("aside")!;
+  old.querySelector("p")!.textContent = "Changed old alert wording";
+  const beforeReplacement = await fixture.worker.submissionDomState(fixture.page);
+  expect(chatGptNewUnboundGenerationError(baseline, {
+    conversationAlertCount: Number(beforeReplacement.conversationAlertCount), stopVisible: false,
+  })).toBeUndefined();
+  expect(await fixture.worker.captureConversationAlertEvidence(fixture.page)).toEqual([]);
+
+  old.remove();
+  const replacement = fixture.window.document.createElement("aside");
+  replacement.setAttribute("role", "alert");
+  replacement.setAttribute("data-testid", "replacement");
+  replacement.innerHTML = '<p>Replacement error</p><button data-testid="regenerate-thread-error-button">Retry</button>';
+  fixture.window.document.body.appendChild(replacement);
+  hideRegenerateMarker(fixture);
+  const afterReplacement = await fixture.worker.submissionDomState(fixture.page);
+  expect(afterReplacement.conversationAlertCount).toBe(1);
+  expect(chatGptNewUnboundGenerationError(baseline, {
+    conversationAlertCount: Number(afterReplacement.conversationAlertCount), stopVisible: false,
+  })).toBeUndefined();
+  expect((await fixture.worker.captureConversationAlertEvidence(fixture.page)).map(row => row.dataTestId))
+    .toEqual(["replacement"]);
+});
+
+test("hidden pre-existing alert visibility changes runtime count but not diagnostic identity", async () => {
+  const fixture = conversationAlertFixture(alertFixtureHtml);
+  hideRegenerateMarker(fixture);
+  const aside = fixture.window.document.querySelector("aside")!;
+  aside.setAttribute("data-hidden", "true");
+  const baseline = await fixture.page.evaluate(chatGptGenerationErrorSignalsInPage);
+  aside.removeAttribute("data-hidden");
+  const state = await fixture.worker.submissionDomState(fixture.page);
+  expect(chatGptNewUnboundGenerationError(baseline, {
+    conversationAlertCount: Number(state.conversationAlertCount), stopVisible: false,
+  })).toBe("conversation_alert");
+  expect(await fixture.worker.captureConversationAlertEvidence(fixture.page)).toEqual([]);
+});
+
+test("same-document routing refreshes the next Send baseline; new document globals cannot reuse it", async () => {
+  const fixture = conversationAlertFixture(alertFixtureHtml);
+  await fixture.page.evaluate(chatGptGenerationErrorSignalsInPage);
+  fixture.page.url = () => "https://chatgpt.com/c/same-document-route";
+  expect(await fixture.worker.captureConversationAlertEvidence(fixture.page)).toEqual([]);
+  const fresh = fixture.window.document.createElement("aside");
+  fresh.setAttribute("role", "alert");
+  fresh.setAttribute("data-testid", "routed-new");
+  fresh.innerHTML = '<button data-testid="regenerate-thread-error-button">Retry</button>Routed error';
+  fixture.window.document.body.appendChild(fresh);
+  expect((await fixture.worker.captureConversationAlertEvidence(fixture.page)).map(row => row.dataTestId))
+    .toEqual(["routed-new"]);
+  await fixture.page.evaluate(chatGptGenerationErrorSignalsInPage);
+  expect(await fixture.worker.captureConversationAlertEvidence(fixture.page)).toEqual([]);
+
+  // A new VM really replaces the DOM and JavaScript global, while retaining the Page handle.
+  const newDocument = conversationAlertFixture(alertFixtureHtml);
+  await newDocument.page.evaluate(() => {
+    const scope = globalThis as typeof globalThis & { __CODEX_WEB_GPT_ALERT_BASELINE__?: WeakSet<Element> };
+    delete scope.__CODEX_WEB_GPT_ALERT_BASELINE__;
+  });
+  fixture.page.evaluate = newDocument.page.evaluate;
+  expect(await fixture.worker.captureConversationAlertEvidence(fixture.page)).toEqual([]);
+  await fixture.page.evaluate(chatGptGenerationErrorSignalsInPage);
+  expect(await fixture.worker.captureConversationAlertEvidence(fixture.page)).toEqual([]);
+});
+
+test("an alert disappearing during detailed collection provides no detached-node evidence", async () => {
+  const fixture = conversationAlertFixture(alertFixtureHtml);
+  const aside = fixture.window.document.querySelector("aside")!;
+  aside.getBoundingClientRect = () => {
+    aside.remove();
+    return { x: 0, y: 0, width: 100, height: 40 } as DOMRect;
+  };
+  expect(await fixture.worker.captureConversationAlertEvidence(fixture.page)).toEqual([]);
+});
+
+test("classifier still counts copied standalone alerts that diagnostic evidence rejects", async () => {
+  const { worker, page, window } = conversationAlertFixture("<p>page ready</p>");
+  const baseline = await page.evaluate(chatGptGenerationErrorSignalsInPage);
+  for (const text of ["copied prompt and tool output", "unrelated toast notification"]) {
+    const alert = window.document.createElement("aside");
+    alert.setAttribute("role", "alert");
+    alert.textContent = text;
+    window.document.body.appendChild(alert);
+  }
+  const current = await page.evaluate(chatGptGenerationErrorSignalsInPage);
+  expect(current.conversationAlertCount).toBe(2);
+  expect(chatGptNewUnboundGenerationError(baseline, {
+    ...current, stopVisible: false,
+  })).toBe("conversation_alert");
+  expect(await worker.captureConversationAlertEvidence(page)).toEqual([]);
+});
+test("capture-only failure preserves the classifier error and releases the attached turn without interaction", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-capture-failure-"));
+  const fixture = conversationAlertFixture(alertFixtureHtml);
+  hideRegenerateMarker(fixture);
+  const aside = fixture.window.document.querySelector("aside")!;
+  let rectReads = 0;
+  aside.getBoundingClientRect = () => {
+    if (++rectReads > 1) throw new Error("capture-only rect failure");
+    return { x: 430.5, y: 855, width: 768, height: 66 } as DOMRect;
+  };
+  const error = await fixture.worker.waitForNewAssistantTurn(fixture.page, {
+    initialTurnIdentities: [], domCache: {},
+    generationError: { regenerateVisible: false, terminalTextVisible: false, conversationAlertCount: 0 },
+  }, undefined).catch((caught: unknown) => caught);
+  expect(error).toMatchObject({
+    name: "ChatGptWebAdapterError", code: "upstream_server_error", retryable: false,
+    message: "ChatGPT accepted the message, then displayed a conversation alert instead of an assistant turn. Do not resend the prompt.",
+  });
+  const harness = ownedPersistenceHarness(root, fixture.page, "capture_failure");
+  Object.assign(harness.worker, {
+    prepareChatSurface: async () => {},
+    selectModelAndEffort: async () => { throw error; },
+  });
+  try {
+    await expect(harness.worker.run(harness.turn)).rejects.toBe(error);
+    expect(harness.preparedReleases()).toBe(1);
+    expect(harness.leaseReleases()).toBe(1);
+    expect(harness.worker.attachedOwnedPages.size).toBe(0);
+    expect(harness.sendCalls()).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+test("unbound classification rejects before bounded evidence evaluation resolves", async () => {
+  const { worker, page } = conversationAlertFixture("<aside role=\"alert\">upstream problem</aside>");
+  worker.submissionDomState = async () => ({
+    turnIdentities: [], userIdentities: [], responseIdentities: [],
+    visibleStopButtonCount: 0, conversationAlertCount: 1,
+    regenerateButtonVisible: false, terminalErrorVisible: false,
+  });
+  let markStarted!: () => void;
+  const started = new Promise<void>(resolve => { markStarted = resolve; });
+  let releaseEvaluation!: () => void;
+  const evaluationGate = new Promise<void>(resolve => { releaseEvaluation = resolve; });
+  let markFinished!: () => void;
+  const finished = new Promise<void>(resolve => { markFinished = resolve; });
+  const evaluate = page.evaluate.bind(page);
+  page.evaluate = async (...args: Parameters<Page["evaluate"]>) => {
+    markStarted();
+    await evaluationGate;
+    try { return await evaluate(...args); }
+    finally { markFinished(); }
+  };
+  const classified = worker.waitForNewAssistantTurn(page, {
+    initialTurnIdentities: [], domCache: {},
+    generationError: { regenerateVisible: false, terminalTextVisible: false, conversationAlertCount: 0 },
+  }, undefined).catch((error: unknown) => error);
+  await started;
+  const error = await classified;
+  expect(error).toMatchObject({
+    code: "upstream_server_error",
+    retryable: false,
+    message: "ChatGPT accepted the message, then displayed a conversation alert instead of an assistant turn. Do not resend the prompt.",
+  });
+  releaseEvaluation();
+  await finished;
+});
+
+
+test("alert evidence survives alert removal and persists at turn-failed before release", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-alert-diagnostic-"));
+  const { worker: observer, page, window, baseline } = conversationAlertFixture(
+    '<aside role="alert"><button data-testid="regenerate-thread-error-button" data-hidden="true">Retry</button>Unable to generate response</aside>');
+  const error = await observer.waitForNewAssistantTurn(page, baseline, undefined).catch((error: unknown) => error);
+  expect(error).toMatchObject({ retryable: false, code: "upstream_server_error" });
+  window.document.querySelector("aside")!.remove();
+  const capabilities = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false };
+  let released = false;
+  const prepared = { ...compileChatGptWebPrompt({
+    modelId: CHATGPT_WEB_MODEL_ID, stream: true, options: { reasoning: "low" },
+    context: { messages: [{ role: "user", content: "private prompt", timestamp: 1 }] },
+  }, capabilities), release() { released = true; } };
+  // Exercise the real turn exception/persistence boundary with a disposable page.
+  const worker = ChatGptBrowserWorker.forProvider({
+    adapter: "chatgpt-web", baseUrl: `browser://${root}`, chatgptWeb: { browserDiagnosticsPath: root },
+  }) as unknown as {
+    runBrowserTurn(turn: unknown, surfaceId: undefined, page: Page): Promise<string>;
+  };
+  Object.assign(worker, {
+    prepareChatSurface: async () => {},
+    selectModelAndEffort: async () => { throw error; },
+  });
+  try {
+    await expect(worker.runBrowserTurn({
+      traceId: "alert_persistence", modelId: CHATGPT_WEB_MODEL_ID, reasoning: "low", capabilities,
+      prepare: async () => prepared, onTextDelta() {}, onReasoningSummary() {},
+    }, undefined, page)).rejects.toBe(error);
+    const [directory] = readdirSync(root);
+    const file = readdirSync(join(root, directory!)).find(name => name.endsWith("-turn-failed.json"))!;
+    const diagnostic = JSON.parse(readFileSync(join(root, directory!, file), "utf8"));
+    expect(diagnostic.state.conversationAlerts).toHaveLength(1);
+    expect(diagnostic.state.conversationAlerts[0].text).toContain("Unable to generate response");
+    expect(diagnostic.state.conversationAlerts[0].buttonLabels).toEqual(["Retry"]);
+    expect(JSON.stringify(diagnostic)).not.toContain("private prompt");
+    expect(released).toBe(true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("closed-page alert evidence persists without a second evaluation through attached lease release", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-closed-alert-"));
+  const fixture = conversationAlertFixture(alertFixtureHtml);
+  hideRegenerateMarker(fixture);
+  const { error, evidence } = await unboundAlertFailure(fixture);
+  const harness = ownedPersistenceHarness(root, fixture.page, "closed_alert");
+  Object.assign(harness.worker, {
+    prepareChatSurface: async () => {},
+    selectModelAndEffort: async () => {
+      fixture.page.isClosed = () => true;
+      evaluateCalls = 0; // Only persistence after closure is under test, not earlier checkpoints.
+      throw error;
+    },
+  });
+  let evaluateCalls = 0;
+  const evaluate = fixture.page.evaluate.bind(fixture.page);
+  fixture.page.evaluate = async (...args: Parameters<Page["evaluate"]>) => {
+    evaluateCalls += 1;
+    if (fixture.page.isClosed()) throw new Error("persistence evaluated a closed page");
+    return evaluate(...args);
+  };
+  try {
+    await expect(harness.worker.run(harness.turn)).rejects.toBe(error);
+    expect(error.message).toContain("conversation alert");
+    expect(evaluateCalls).toBe(0);
+    expect(readTurnFailed(root, "closed_alert").state.conversationAlerts).toEqual(evidence);
+    expect(harness.preparedReleases()).toBe(1);
+    expect(harness.leaseReleases()).toBe(1);
+    expect(harness.worker.attachedOwnedPages.size).toBe(0);
+    expect(harness.sendCalls()).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("real 413 observer keeps context_length_exceeded and alert evidence through attached failure release", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-413-alert-"));
+  const fixture = conversationAlertFixture(alertFixtureHtml);
+  hideRegenerateMarker(fixture);
+  const frame = {};
+  Object.assign(fixture.page, { mainFrame: () => frame });
+  let classifiedError: unknown;
+  const harness = ownedPersistenceHarness(root, fixture.page, "alert_413");
+  Object.assign(harness.worker, {
+    prepareChatSurface: async () => {},
+    selectModelAndEffort: async () => ({ effort: "low" }),
+    assertSelectedEffort: async () => {},
+    captureSubmissionBaseline: async () => fixture.baseline,
+    attachPromptWithCompactionRetry: async () => {},
+    attachFiles: async () => {},
+    sendAttachedPrompt: async (_page: Page, _baseline: unknown, _capture: unknown, _signal: unknown,
+      _progress: unknown, lifecycle: { onSendActivated?: () => Promise<void> }) => {
+      harness.recordSend();
+      await lifecycle.onSendActivated?.();
+      const request = { method: () => "POST", url: () => "https://chatgpt.com/backend-api/f/conversation",
+        frame: () => frame };
+      fixture.page.emit("request", request);
+      fixture.page.emit("response", {
+        request: () => request, status: () => 413,
+        headers: () => ({ "content-type": "application/json" }),
+        json: async () => ({ detail: { code: "message_length_exceeds_limit" } }),
+      });
+      return "user_turn";
+    },
+  });
+  const waitFor = harness.worker.waitForNewAssistantTurn.bind(harness.worker);
+  harness.worker.waitForNewAssistantTurn = async (...args: unknown[]) => {
+    try { return await waitFor(...args); }
+    catch (error) { classifiedError = error; throw error; }
+  };
+  try {
+    await expect(harness.worker.run(harness.turn)).rejects.toMatchObject({
+      code: "context_length_exceeded", retryable: false,
+    });
+    expect(classifiedError).toMatchObject({ code: "upstream_server_error", retryable: false });
+    expect((classifiedError as Error).message).toContain("conversation alert");
+    const diagnostic = readTurnFailed(root, "alert_413");
+    expect(diagnostic.error).toContain("exceeds the selected mode's input-size limit");
+    expect(diagnostic.state.conversationAlerts).toHaveLength(1);
+    expect(harness.preparedReleases()).toBe(1);
+    expect(harness.leaseReleases()).toBe(1);
+    expect(harness.worker.attachedOwnedPages.size).toBe(0);
+    expect(harness.sendCalls()).toBe(1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("diagnostic mkdir failure preserves original failure and releases attached lease without retry", async () => {
+  const parent = mkdtempSync(join(tmpdir(), "cgw-diagnostic-file-"));
+  const root = join(parent, "not-a-directory");
+  writeFileSync(root, "forces privateDirectory mkdir failure");
+  const fixture = conversationAlertFixture(alertFixtureHtml);
+  hideRegenerateMarker(fixture);
+  const { error } = await unboundAlertFailure(fixture);
+  const harness = ownedPersistenceHarness(root, fixture.page, "mkdir_failure");
+  Object.assign(harness.worker, {
+    prepareChatSurface: async () => {},
+    selectModelAndEffort: async () => { throw error; },
+  });
+  try {
+    await expect(harness.worker.run(harness.turn)).rejects.toBe(error);
+    expect(error.message).toContain("conversation alert");
+    expect(harness.preparedReleases()).toBe(1);
+    expect(harness.leaseReleases()).toBe(1);
+    expect(harness.worker.attachedOwnedPages.size).toBe(0);
+    expect(harness.sendCalls()).toBe(0);
+  } finally { rmSync(parent, { recursive: true, force: true }); }
+});
+const alertFixtureHtml = `<aside role="alert"><p>Unable to generate response</p>
+  <button data-testid="regenerate-thread-error-button">Retry</button></aside>`;
+
+function hideRegenerateMarker(fixture: ConversationAlertFixture): void {
+  const button = fixture.window.document.querySelector('[data-testid="regenerate-thread-error-button"]')!;
+  button.getBoundingClientRect = () => ({ x: 0, y: 0, width: 0, height: 0 }) as DOMRect;
+}
+
+async function unboundAlertFailure(fixture: ConversationAlertFixture) {
+  const error = await fixture.worker.waitForNewAssistantTurn(fixture.page, fixture.baseline, undefined)
+    .then(() => { throw new Error("expected unbound generation failure"); }, (failure: unknown) => failure);
+  expect(error).toMatchObject({ retryable: false, code: "upstream_server_error" });
+  if (!(error instanceof Error)) throw new Error("Expected the original browser Error");
+  expect(error.message).toContain("conversation alert");
+  const evidence = await fixture.worker.captureConversationAlertEvidence(fixture.page);
+  expect(evidence).toHaveLength(1);
+  return { error, evidence };
+}
+
+type OwnedPersistenceWorker = {
+  run(turn: unknown): Promise<string>;
+  pageForNewTurn(): Promise<Page>;
+  prepareChatSurface(): Promise<void>;
+  selectModelAndEffort(): Promise<{ effort: string }>;
+  releaseAttachedConversation(key: string): Promise<void>;
+  attachedOwnedPages: Map<string, unknown>;
+  waitForNewAssistantTurn(...args: unknown[]): Promise<unknown>;
+};
+
+function ownedPersistenceHarness(root: string, page: Page, traceId: string) {
+  const capabilities = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false };
+  const compiled = compileChatGptWebPrompt({
+    modelId: CHATGPT_WEB_MODEL_ID, stream: true, options: { reasoning: "low" },
+    context: { messages: [{ role: "user", content: "private prompt", timestamp: 1 }] },
+  }, capabilities);
+  let preparedReleases = 0;
+  const prepared = { ...compiled, release() { preparedReleases += 1; } };
+  let sends = 0;
+  const worker = ChatGptBrowserWorker.forProvider({
+    adapter: "chatgpt-web", baseUrl: `browser://${root}`,
+    chatgptWeb: {
+      browserHost: "attached-chrome", browserAttachEndpoint: "http://127.0.0.1:39222",
+      browserDiagnosticsPath: root,
+    },
+  }) as unknown as OwnedPersistenceWorker;
+  worker.pageForNewTurn = async () => page;
+  worker.prepareChatSurface = async () => {};
+  worker.selectModelAndEffort = async () => ({ effort: "low" });
+  page.close = async () => { page.isClosed = () => true; };
+  const release = worker.releaseAttachedConversation.bind(worker);
+  let leaseReleases = 0;
+  worker.releaseAttachedConversation = async (key: string) => {
+    leaseReleases += 1;
+    return release(key);
+  };
+  const turn = {
+    traceId, modelId: CHATGPT_WEB_MODEL_ID, reasoning: "low", capabilities,
+    prepare: async () => prepared, prepareResume: async () => prepared,
+    onTextDelta() {}, onReasoningSummary() {}, retainConversation: true,
+    conversationKey: "stage_d1_persist",
+  };
+  return {
+    worker, turn,
+    preparedReleases: () => preparedReleases,
+    leaseReleases: () => leaseReleases,
+    sendCalls: () => sends,
+    recordSend: () => { sends += 1; },
+  };
+}
+
+type PersistedTurnFailure = {
+  state: { conversationAlerts?: ConversationAlertEvidence[] };
+  error: string;
+};
+
+function readTurnFailed(root: string, traceId: string): PersistedTurnFailure {
+  const directory = readdirSync(root).find(name => name.startsWith(`${traceId}-`))!;
+  const filename = readdirSync(join(root, directory)).find(name => name.endsWith("-turn-failed.json"))!;
+  return JSON.parse(readFileSync(join(root, directory, filename), "utf8")) as PersistedTurnFailure;
+}
+
+test("alert capture bounds candidate, result, control, attribute and raw-text work", async () => {
+  const ineligible = Array.from({ length: 126 }, (_, index) =>
+    `<aside role="alert">unidentified ${index}</aside>`).join("");
+  const html = `${ineligible}
+    <aside role="alert" aria-label="${"A".repeat(200)}" data-testid="${"B".repeat(200)}"><button data-testid="regenerate-thread-error-button">Retry</button>${"x".repeat(16_385)}</aside>
+    <aside role="alert" aria-label="${"long aria label ".repeat(30)}" data-testid="${"long test id ".repeat(30)}">
+      <button data-testid="regenerate-thread-error-button">Retry</button>
+      ${Array.from({ length: 1_000 }, (_, index) => `<button aria-label="control ${index}"></button>`).join("")}
+      accepted within candidate cap
+    </aside>
+    ${Array.from({ length: 198 }, (_, index) =>
+      `<aside role="alert"><button data-testid="regenerate-thread-error-button">Retry</button>extra ${index}</aside>`).join("")}`;
+  const { worker, page } = conversationAlertFixture(html);
+  const evidence = await worker.captureConversationAlertEvidence(page);
+  expect(evidence).toHaveLength(1);
+  expect(evidence[0]!.text).not.toContain("x".repeat(20));
+  expect(evidence[0]!.text).toContain("accepted within candidate cap");
+  expect(evidence[0]!.ariaLabel.length).toBeLessThanOrEqual(80);
+  expect(evidence[0]!.dataTestId.length).toBeLessThanOrEqual(80);
+  expect(evidence[0]!.buttonLabels).toHaveLength(8);
+  expect(evidence[0]!.buttonLabels.every(label => label.length <= 80)).toBe(true);
+});
+test("alert evidence caps accepted results at eight of two hundred matching alerts", async () => {
+  const html = Array.from({ length: 200 }, (_, index) =>
+    `<aside role="alert" data-testid="alert-${index}"><button data-testid="regenerate-thread-error-button">Retry</button>alert ${index}</aside>`).join("");
+  const { page, worker } = conversationAlertFixture(html);
+  const evidence = await worker.captureConversationAlertEvidence(page);
+  expect(evidence).toHaveLength(8);
+  expect(evidence.map(row => row.dataTestId)).toEqual(Array.from({ length: 8 }, (_, index) => `alert-${index}`));
+});
+
+
+test("diagnostic sanitizer allows only scoped alert fields and reapplies bounds", () => {
+  const diagnostic = sanitizeChatGptBrowserDiagnosticState({
+    text: "private outside text", ariaLabel: "private outside label", dataTestId: "private outside id",
+    conversationAlerts: Array.from({ length: 10 }, () => ({
+      tag: "aside", role: "alert", index: 9,
+      text: "error ".repeat(120), textChars: 719, truncated: true,
+      ariaLabel: "Bearer confidential", dataTestId: "conversation-error",
+      rect: { x: 1, y: 2, width: 3, height: 4, secret: "private" }, rendered: true,
+      buttonLabels: Array.from({ length: 10 }, () => "label ".repeat(20)),
+      outerHTML: "<aside>private</aside>", cookies: "private", headers: { Authorization: "private" },
+    })),
+  }) as { conversationAlerts: ConversationAlertEvidence[] };
+  expect(Object.keys(diagnostic)).toEqual(["conversationAlerts"]);
+  expect(diagnostic.conversationAlerts).toHaveLength(8);
+  const [alert] = diagnostic.conversationAlerts;
+  expect(Object.keys(alert).sort()).toEqual([
+    "ariaLabel", "buttonLabels", "dataTestId", "rect", "rendered", "role", "tag", "text", "textChars", "truncated",
+  ]);
+  expect(alert.text).toHaveLength(500);
+  expect(alert.buttonLabels).toHaveLength(8);
+  expect(alert.buttonLabels.every((label: string) => label.length <= 80)).toBe(true);
+  expect(alert.ariaLabel).toBe("[redacted]");
+  expect(alert.rect).toEqual({ x: 1, y: 2, width: 3, height: 4 });
+  expect(JSON.stringify(diagnostic)).not.toContain("private");
+});
+test("persistence sanitizer rejects malformed rows, unexpected types and every forbidden alert field", () => {
+  const forbidden = [
+    "outerHTML", "innerHTML", "innerText", "prompt", "assistantResponse", "toolArguments",
+    "toolResult", "cookies", "headers", "authorization", "localStorage", "sessionStorage",
+    "href", "children", "stack", "randomNestedObject",
+  ];
+  const diagnostic = sanitizeChatGptBrowserDiagnosticState({
+    conversationAlerts: [
+      null, 1, "malformed",
+      { tag: "div", role: "alert", text: "wrong tag" },
+      { tag: "aside", role: "status", text: "wrong role" },
+      {
+        tag: "aside", role: "alert", text: false, ariaLabel: {}, dataTestId: 42,
+        textChars: -1, truncated: "true", rendered: "true",
+        rect: { x: NaN, y: Infinity, width: "3", height: 4 },
+        buttonLabels: [null, {}, 42, 'password="short secret value"'],
+        ...Object.fromEntries(forbidden.map(key => [key, { tag: "forbidden", number: 99 }])),
+      },
+    ],
+  });
+  expect(diagnostic).toEqual({ conversationAlerts: [{
+    tag: "aside", role: "alert", rect: { height: 4 }, textChars: 0,
+    truncated: false, rendered: false, buttonLabels: ["[redacted]"],
+  }] });
+  expect(sanitizeChatGptBrowserDiagnosticState({ conversationAlerts: {} })).toEqual({});
+});
+
 test("the generation-error scan counts a sized aside alert and does not return its text", () => {
   const previousDocument = globalThis.document;
   const previousComputed = globalThis.getComputedStyle;
+  const scope = globalThis as typeof globalThis & { __CODEX_WEB_GPT_ALERT_BASELINE__?: WeakSet<Element> };
+  const previousBaseline = scope.__CODEX_WEB_GPT_ALERT_BASELINE__;
   const element = {
     tagName: "ASIDE",
     textContent: "x".repeat(113),
@@ -1249,6 +2038,8 @@ test("the generation-error scan counts a sized aside alert and does not return i
   } finally {
     globalThis.document = previousDocument;
     globalThis.getComputedStyle = previousComputed;
+    if (previousBaseline) scope.__CODEX_WEB_GPT_ALERT_BASELINE__ = previousBaseline;
+    else delete scope.__CODEX_WEB_GPT_ALERT_BASELINE__;
   }
 });
 
@@ -1973,6 +2764,7 @@ for (const captureScreenshots of [false, true]) test(`connector failure persists
   else delete process.env.CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS;
   let screenshots = 0;
   const page = {
+    isClosed: () => false,
     screenshot: async () => { screenshots += 1; return Buffer.from("diagnostic screenshot fixture"); },
     evaluate: async () => ({
       url: "https://chatgpt.com/c/private-conversation",
@@ -2039,6 +2831,7 @@ test("successful connector verification clears the proven selection before relea
   const diagnosticsRoot = mkdtempSync(join(tmpdir(), "cgw-connector-verification-success-"));
   const calls: string[] = [];
   const page = {
+    isClosed: () => false,
     evaluate: async () => ({
       location: { origin: "https://chatgpt.com", pathSegments: 0, temporaryChat: true },
       surfaceBound: true,

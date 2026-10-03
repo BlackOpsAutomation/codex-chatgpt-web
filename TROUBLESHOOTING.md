@@ -240,6 +240,42 @@ already accepted. Do not resend that prompt. A conversation alert, response erro
 is also not a reason to submit the prompt again. A Stop control still means generation may be in
 progress; that wait stays bounded and does not click Retry.
 
+After a non-retryable unbound failure is classified, best-effort capture can add
+`state.conversationAlerts` to the local `turn-failed` JSON. Wording is retained only for a new,
+visible `aside[role="alert"]` containing ChatGPT's existing
+`data-testid="regenerate-thread-error-button"` response-error control. Recognized conversation
+and composer ancestors/descendants are additionally excluded. Unidentified asides, standalone
+copied prompt/tool-like alerts, and unmarked global toasts provide no wording evidence.
+The runtime count/visibility classifier is unchanged: an unrelated new aside can still fail a
+turn, and the diagnostic marker is evidence of a UI surface, not proof of the upstream cause.
+
+Up to eight rows retain normalized text (500 characters), original normalized character count,
+truncation flag, identifying attributes (80 characters), finite dimensions, rendered state, and
+up to eight alert-local control labels (80 characters). Capture examines at most the first 128
+asides, omits alert text longer than 16,384 raw characters, and bounds strings before credential
+redaction. Quoted assignments and quoted JSON credential keys, including escaped quotes and
+backslashes, are redacted before leaving the page and again before persistence. Unclosed quoted
+values are redacted through the inspected end, including a trailing backslash at the inspection
+bound. This is not exhaustive DLP: copied content or
+arbitrary labels within a positively identified error surface can still be retained. Do not
+assume that all sensitive wording is detectable; treat these local traces as private.
+
+Attribution is diagnostic-only node identity, refreshed before every physical Send and including
+hidden pre-existing alerts. Same-document routes preserve membership; removal/remount creates a
+new node, while wording changes on an existing node remain excluded. A replaced document without
+the pre-Send baseline provides no evidence. These rules do not change failure classification.
+Detailed capture has a 250 ms observation deadline and never delays propagation of the classified
+failure. Only the diagnostic writer waits for pending capture; DOM/serialization/sanitization
+failures yield no added evidence. HTTP 413 keeps its existing precedence, with completed and
+pending evidence transferred if that error replaces the unbound failure.
+
+Already-captured evidence is bounded plain data associated with the failure. Its persistence
+requires no live page, DOM scan, or screenshot, and survives page closure. Writer failures remain
+secondary; finalization and owned-page release are unchanged. No alert HTML, page-wide wording,
+network bodies, headers, cookies, or storage are added. Other diagnostic checkpoints, trace
+retention, and existing opt-in screenshots are unchanged; those screenshots can retain page
+content and are not covered by this alert-text privacy boundary.
+
 - Read the final detailed error after the reconnect attempts; do not report only the word
   `Reconnecting`.
 - Retry once in a fresh Codex task. State whether the fresh task works and whether the failure is
