@@ -234,6 +234,12 @@ ChatGPT turn. Common causes include an account-side rate limit, ChatGPT's own "S
 state, a changed UI control, a closed browser surface, a conflicting route, or a tool that exceeded
 its bounded MCP deadline.
 
+`ChatGPT accepted the message but did not expose its assistant turn in the DOM` means Send was
+already accepted. Do not resend that prompt. A conversation alert, response error, or
+`Something went wrong` that appears instead of a new assistant turn is now reported directly and
+is also not a reason to submit the prompt again. A Stop control still means generation may be in
+progress; that wait stays bounded and does not click Retry.
+
 - Read the final detailed error after the reconnect attempts; do not report only the word
   `Reconnecting`.
 - Retry once in a fresh Codex task. State whether the fresh task works and whether the failure is

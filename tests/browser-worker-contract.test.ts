@@ -7,6 +7,11 @@ import { createContext, runInContext } from "node:vm";
 import type { Page } from "playwright-core";
 import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptSubmissionRejectionObserver, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
 import { ensureChatGptPersonalizedConnectorAccess, chatGptUnavailableProDetail } from "../src/adapters/chatgpt-web/browser-worker";
+import {
+  chatGptNewUnboundGenerationError,
+  chatGptUnboundGenerationError,
+} from "../src/adapters/chatgpt-web/browser-worker";
+import { chatGptGenerationErrorSignalsInPage } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_STOPPED_THINKING_LABELS } from "../src/adapters/chatgpt-web/ui-labels";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
@@ -1117,6 +1122,133 @@ test("missing-assistant expiry checks fresh DOM after a delayed wake while prese
     }
   } finally {
     Date.now = realDateNow;
+  }
+});
+
+test("a new conversation alert after Send fails closed without waiting or resending", async () => {
+  const hiddenLocator = {
+    filter() { return this; },
+    last() { return this; },
+    isVisible: async () => false,
+    press: async () => { throw new Error("Retry or Send was pressed"); },
+  };
+  const page = {
+    isClosed: () => false,
+    locator: () => hiddenLocator,
+  } as unknown as Page;
+  const worker = ChatGptBrowserWorker.forProvider({
+    adapter: "chatgpt-web",
+    baseUrl: "browser://unbound-alert",
+    chatgptWeb: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+  }) as unknown as {
+    waitForNewAssistantTurn(page: Page, baseline: {
+      initialTurnIdentities: string[];
+      domCache: Record<string, unknown>;
+      generationError?: { regenerateVisible: boolean; terminalTextVisible: boolean; conversationAlertCount: number };
+    }, deadline: undefined): Promise<unknown>;
+    submissionDomState(): Promise<Record<string, unknown>>;
+    waitForTurnDomOrExternalProgress(): Promise<void>;
+  };
+  let waits = 0;
+  worker.submissionDomState = async () => ({
+    turnIdentities: ["conversation-turn-user"],
+    userIdentities: ["conversation-turn-user"],
+    responseIdentities: [],
+    visibleStopButtonCount: 0,
+    conversationAlertCount: 1,
+    regenerateButtonVisible: false,
+    terminalErrorVisible: false,
+  });
+  worker.waitForTurnDomOrExternalProgress = async () => {
+    waits += 1;
+    throw new Error("alerted turn was allowed to keep waiting");
+  };
+  const clean = {
+    regenerateVisible: false,
+    terminalTextVisible: false,
+    conversationAlertCount: 0,
+  };
+  await expect(worker.waitForNewAssistantTurn(page, {
+    initialTurnIdentities: [],
+    domCache: {},
+    generationError: clean,
+  }, undefined)).rejects.toMatchObject({
+    name: "ChatGptWebAdapterError",
+    status: 502,
+    code: "upstream_server_error",
+    retryable: false,
+    message: "ChatGPT accepted the message, then displayed a conversation alert instead of an assistant turn. Do not resend the prompt.",
+  });
+  expect(waits).toBe(0);
+  expect(chatGptNewUnboundGenerationError(clean, {
+    stopVisible: true,
+    conversationAlertCount: 1,
+  })).toBeUndefined();
+  expect(chatGptNewUnboundGenerationError(clean, {
+    stopVisible: false,
+    regenerateVisible: true,
+  })).toBe("regenerate");
+  expect(chatGptNewUnboundGenerationError(clean, {
+    stopVisible: false,
+    terminalTextVisible: true,
+  })).toBe("terminal_text");
+  expect(chatGptNewUnboundGenerationError({
+    regenerateVisible: false,
+    terminalTextVisible: false,
+    conversationAlertCount: 1,
+  }, {
+    stopVisible: false,
+    conversationAlertCount: 1,
+  })).toBeUndefined();
+  expect(chatGptNewUnboundGenerationError(undefined, {
+    stopVisible: false,
+    conversationAlertCount: 1,
+  })).toBeUndefined();
+  expect(chatGptUnboundGenerationError("regenerate").retryable).toBe(false);
+  expect(chatGptUnboundGenerationError("terminal_text").message).toContain("Do not resend");
+});
+
+test("the generation-error scan counts a sized aside alert and does not return its text", () => {
+  const previousDocument = globalThis.document;
+  const previousComputed = globalThis.getComputedStyle;
+  const element = {
+    tagName: "ASIDE",
+    textContent: "x".repeat(113),
+    isConnected: true,
+    getBoundingClientRect: () => ({ width: 768, height: 66, x: 430, y: 855 }),
+    getAttribute: (name: string) => name === "role" ? "alert" : null,
+  };
+  const button = {
+    tagName: "BUTTON",
+    textContent: "Retry",
+    isConnected: true,
+    getBoundingClientRect: () => ({ width: 0, height: 0, x: 0, y: 0 }),
+    getAttribute: (name: string) => name === "data-testid" ? "regenerate-thread-error-button" : null,
+  };
+  globalThis.document = {
+    querySelectorAll: (selector: string) => selector === '[role="alert"]'
+      ? [element]
+      : selector === '[data-testid="regenerate-thread-error-button"]'
+        ? [button]
+        : [],
+  } as unknown as Document;
+  globalThis.getComputedStyle = (() => ({ visibility: "visible" })) as unknown as typeof getComputedStyle;
+  try {
+    const signals = chatGptGenerationErrorSignalsInPage();
+    expect(signals).toEqual({
+      regenerateVisible: false,
+      terminalTextVisible: false,
+      conversationAlertCount: 1,
+    });
+    expect(JSON.stringify(signals)).not.toContain("x".repeat(20));
+    expect(Object.keys(signals).sort()).toEqual([
+      "conversationAlertCount",
+      "regenerateVisible",
+      "terminalTextVisible",
+    ]);
+  } finally {
+    globalThis.document = previousDocument;
+    globalThis.getComputedStyle = previousComputed;
   }
 });
 

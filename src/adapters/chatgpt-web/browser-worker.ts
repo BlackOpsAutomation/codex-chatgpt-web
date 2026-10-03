@@ -910,6 +910,71 @@ export async function throwIfChatGptTerminalErrorAlert(scope: ChatGptTextScope):
   );
 }
 
+export interface ChatGptGenerationErrorBaseline {
+  regenerateVisible: boolean;
+  terminalTextVisible: boolean;
+  conversationAlertCount: number;
+}
+
+export type ChatGptUnboundGenerationErrorKind = "regenerate" | "terminal_text" | "conversation_alert";
+
+/**
+ * A generation error that appears only after Send, while no new assistant identity exists.
+ * A visible Stop control still means generation may mount that identity, so it suppresses the verdict.
+ * An alert already present before Enter is a previous turn and must not reject this submission.
+ */
+export function chatGptNewUnboundGenerationError(
+  baseline: ChatGptGenerationErrorBaseline | undefined,
+  current: {
+    regenerateVisible?: boolean;
+    terminalTextVisible?: boolean;
+    conversationAlertCount?: number;
+    stopVisible: boolean;
+  },
+): ChatGptUnboundGenerationErrorKind | undefined {
+  if (!baseline || current.stopVisible) return undefined;
+  if (current.regenerateVisible === true && !baseline.regenerateVisible) return "regenerate";
+  if (current.terminalTextVisible === true && !baseline.terminalTextVisible) return "terminal_text";
+  if ((current.conversationAlertCount ?? 0) > baseline.conversationAlertCount) return "conversation_alert";
+  return undefined;
+}
+
+export function chatGptUnboundGenerationError(
+  kind: ChatGptUnboundGenerationErrorKind,
+): ChatGptWebAdapterError {
+  const message = kind === "terminal_text"
+    ? "ChatGPT accepted the message, then ended the turn with 'Something went wrong' instead of exposing an assistant turn. Do not resend the prompt."
+    : kind === "regenerate"
+      ? "ChatGPT accepted the message, then displayed a response error instead of an assistant turn. Do not resend the prompt."
+      : "ChatGPT accepted the message, then displayed a conversation alert instead of an assistant turn. Do not resend the prompt.";
+  return new ChatGptWebAdapterError(message, {
+    status: 502,
+    errorType: "server_error",
+    code: "upstream_server_error",
+    retryable: false,
+  });
+}
+
+/** Runs inside the page. Keep the alert scan identical to submissionDomState. */
+export function chatGptGenerationErrorSignalsInPage(): ChatGptGenerationErrorBaseline {
+  const visible = (element: Element): boolean => {
+    const candidate = element as HTMLElement;
+    const style = getComputedStyle(candidate);
+    const bounds = candidate.getBoundingClientRect();
+    return candidate.isConnected
+      && style.visibility !== "hidden"
+      && (bounds.width > 0 || bounds.height > 0);
+  };
+  const generationAlerts = [...document.querySelectorAll('[role="alert"]')].filter(visible);
+  return {
+    regenerateVisible: [...document.querySelectorAll('[data-testid="regenerate-thread-error-button"]')].some(visible),
+    terminalTextVisible: generationAlerts.some(element => (
+      /Something went wrong[\s\S]*help\.openai\.com/i.test(element.textContent ?? "")
+    )),
+    conversationAlertCount: generationAlerts.filter(element => element.tagName === "ASIDE").length,
+  };
+}
+
 export async function resolveChatGptToolConfirmation(
   page: Page,
   appName: string,
@@ -1319,6 +1384,8 @@ interface ChatGptSubmissionBaseline {
   domCache: ChatGptSubmissionDomCache;
   submittedText?: string;
   acceptedUserIdentity?: string;
+  /** Generation-error signals visible immediately before Enter. Absence means the check is disabled. */
+  generationError?: ChatGptGenerationErrorBaseline;
 }
 
 interface ChatGptSubmissionObservationRecovery {
@@ -1343,6 +1410,9 @@ interface ChatGptSubmissionDomState {
   userTurnCount: number;
   assistantTurnCount: number;
   visibleStopButtonCount: number;
+  regenerateButtonVisible: boolean;
+  terminalErrorVisible: boolean;
+  conversationAlertCount: number;
   turnIdentities: string[];
   userIdentities: string[];
   responseIdentities: string[];
@@ -3078,12 +3148,22 @@ export class ChatGptBrowserWorker {
         if (group.querySelector("[data-user-message-bubble]")) userIdentities.push(user);
         if (group.querySelector('[data-conversation-role="assistant"], [data-chatgpt-agent-turn-start]')) responseIdentities.push(assistant);
       });
+      const generationAlerts = [...document.querySelectorAll('[role="alert"]')].filter(visible);
+      const terminalErrorVisible = generationAlerts.some(element => (
+        /Something went wrong[\s\S]*help\.openai\.com/i.test(element.textContent ?? "")
+      ));
+      const conversationAlertCount = generationAlerts.filter(element => element.tagName === "ASIDE").length;
+      const regenerateButtonVisible = [...document.querySelectorAll('[data-testid="regenerate-thread-error-button"]')]
+        .some(visible);
       return {
         key: observerKey,
         snapshot: {
           userTurnCount: userIdentities.length,
           assistantTurnCount: responseIdentities.length,
           visibleStopButtonCount: [...document.querySelectorAll(options.stopButtonSelector)].filter(visible).length,
+          regenerateButtonVisible,
+          terminalErrorVisible,
+          conversationAlertCount,
           turnIdentities,
           userIdentities,
           responseIdentities,
@@ -3260,6 +3340,14 @@ export class ChatGptBrowserWorker {
       if (state.visibleStopButtonCount > 0) {
         responseDeadline = Math.min(deadline ?? Number.POSITIVE_INFINITY, Date.now() + graceMs);
       }
+      const unboundError = chatGptNewUnboundGenerationError(observationBaseline.generationError, {
+        regenerateVisible: state.regenerateButtonVisible,
+        terminalTextVisible: state.terminalErrorVisible,
+        conversationAlertCount: state.conversationAlertCount,
+        stopVisible: state.visibleStopButtonCount > 0,
+      });
+      // The message is already accepted. Classify the alert and stop; never press Send again.
+      if (unboundError) throw chatGptUnboundGenerationError(unboundError);
       // A delayed renderer wake can cross the grace while the assistant appears. Only a fresh
       // observation can prove it is still missing; the explicit turn deadline remains above.
       if (Date.now() >= responseDeadline
@@ -3850,6 +3938,12 @@ export class ChatGptBrowserWorker {
       await settleChatGptUi();
     }
     await captureDiagnostic?.("send-ready");
+    if (typeof page.evaluate === "function") {
+      baseline.generationError = await withChatGptBrowserObservationTimeout(withBrowserTurnAbort(
+        page.evaluate(chatGptGenerationErrorSignalsInPage),
+        abortSignal,
+      ));
+    }
     const initialToolBatchRevision = externalProgress?.snapshot().lastToolBatchRevision ?? 0;
     await submissionLifecycle?.onSendActivated?.();
     await sendButton.press("Enter", {
